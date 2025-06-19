@@ -27,7 +27,33 @@ except ImportError:
 
 
 class CsvDataset(Dataset):
-    def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
+    def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
+        logging.debug(f'Loading csv data from {input_filename}.')
+        df = pd.read_csv(input_filename, sep=sep)
+
+        self.images = df[img_key].tolist()
+        self.captions = df[caption_key].tolist()
+        self.transforms = transforms
+        logging.debug('Done loading data.')
+
+        self.tokenize = tokenizer
+        self.base_dir = base_folder
+        '''if is_train:
+            self.base_dir = os.path.join(base_folder, "images")
+        else:
+            self.base_dir = os.path.join(base_folder, "val_images")'''
+
+    def __len__(self):
+        return len(self.captions)
+
+    def __getitem__(self, idx):
+        #images = self.transforms(Image.open(str(self.images[idx])))
+        images = self.transforms(Image.open(os.path.join(self.base_dir, str(self.images[idx]))))
+        texts = self.tokenize([str(self.captions[idx])])[0]
+        return images, texts
+
+class DistillationCsvDataset(Dataset):
+    def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
         logging.debug(f'Loading csv data from {input_filename}.')
         df = pd.read_csv(input_filename, sep=sep)
 
@@ -38,14 +64,28 @@ class CsvDataset(Dataset):
 
         self.tokenize = tokenizer
 
+        self.is_train = is_train
+        if is_train:
+            self.dist_image_features = torch.load(os.path.join(base_folder, "image_features.pt"))
+            self.dist_text_features = torch.load(os.path.join(base_folder, "text_features.pt"))
+            logging.debug(f'Loaded distillation features, {self.dist_image_features.shape}, {self.dist_text_features.shape}') 
+            self.base_dir = os.path.join(base_folder, "images")
+        else:
+            self.dist_image_features = [None] * len(self.images)
+            self.dist_text_features = [None] * len(self.images)
+            self.base_dir = os.path.join(base_folder, "val_images")           
+
     def __len__(self):
         return len(self.captions)
 
     def __getitem__(self, idx):
-        images = self.transforms(Image.open(str(self.images[idx])))
+        images = self.transforms(Image.open(os.path.join(self.base_dir, str(self.images[idx]))))
         texts = self.tokenize([str(self.captions[idx])])[0]
+        if self.is_train:
+            dist_image_features = self.dist_image_features[idx]
+            dist_text_features = self.dist_text_features[idx]
+            return images, texts, dist_image_features, dist_text_features
         return images, texts
-
 
 class SharedEpoch:
     def __init__(self, epoch: int = 0):
@@ -445,12 +485,46 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
 
 def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data
+    base_folder = args.base_folder if is_train else args.val_base_folder
     assert input_filename
     dataset = CsvDataset(
         input_filename,
         preprocess_fn,
         img_key=args.csv_img_key,
         caption_key=args.csv_caption_key,
+        is_train=is_train,
+        base_folder=base_folder,
+        sep=args.csv_separator,
+        tokenizer=tokenizer
+    )
+    num_samples = len(dataset)
+    sampler = DistributedSampler(dataset) if args.distributed and is_train else None
+    shuffle = is_train and sampler is None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=is_train,
+    )
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
+def get_distilled_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+    input_filename = args.train_data if is_train else args.val_data
+    assert input_filename
+    dataset = DistillationCsvDataset(
+        input_filename,
+        preprocess_fn,
+        img_key=args.csv_img_key,
+        caption_key=args.csv_caption_key,
+        is_train=is_train,
+        base_folder=args.base_folder,
         sep=args.csv_separator,
         tokenizer=tokenizer
     )
@@ -524,7 +598,9 @@ def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None
 
 
 def get_dataset_fn(data_path, dataset_type):
-    if dataset_type == "webdataset":
+    if dataset_type == "distillation-csv":
+        return get_distilled_csv_dataset
+    elif dataset_type == "webdataset":
         return get_wds_dataset
     elif dataset_type == "csv":
         return get_csv_dataset

@@ -476,6 +476,12 @@ def main(args):
 
     loss = create_loss(args)
 
+    if args.early_stop and args.imagenet_val:
+        # Initialize early stopping variables
+        early_stop_max_acc = 0.0
+        early_stop_current_epoch = 0
+        accuracy_delta = 1e-4  # Minimum accuracy increase to consider as improvement
+
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
@@ -484,7 +490,7 @@ def main(args):
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            metrics = evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
 
         # Saving checkpoints.
         if args.save_logs:
@@ -515,6 +521,25 @@ def main(args):
                 latest_save_path = os.path.join(args.checkpoint_path, LATEST_CHECKPOINT_NAME)
                 torch.save(checkpoint_dict, tmp_save_path)
                 os.replace(tmp_save_path, latest_save_path)
+            
+            if args.early_stop and args.imagenet_val:
+                # Check if the current accuracy is better than the previous best
+                current_accuracy = metrics['imagenet-zeroshot-val-top1']
+                if current_accuracy > early_stop_max_acc + accuracy_delta:
+                    early_stop_max_acc = current_accuracy
+                    early_stop_current_epoch = 0
+                    # Save the current best model
+                    tmp_save_path = os.path.join(args.checkpoint_path, "tmp.pt")
+                    best_save_path = os.path.join(args.checkpoint_path, "best.pt")
+                    torch.save(checkpoint_dict, tmp_save_path)
+                    os.replace(tmp_save_path, best_save_path)
+                else:
+                    early_stop_current_epoch += 1
+                # Check if we have reached the early stopping criteria
+                if early_stop_current_epoch >= args.patience:
+                    logging.info(f"Early stopping triggered at epoch {completed_epoch}. Best epoch: {completed_epoch - early_stop_current_epoch}.")
+                    logging.info(f"Best Imagenet top-1 accuracy: {early_stop_max_acc:.4f}. Last accuracy: {current_accuracy:.4f}.")
+                    break
 
     if args.wandb and is_master(args):
         wandb.finish()

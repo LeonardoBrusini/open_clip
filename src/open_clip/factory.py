@@ -431,7 +431,7 @@ def create_model(
 
 
 def create_loss(args):
-    if args.distill:
+    if args.distill or args.precomp_distill:
         return DistillClipLoss(
             local_loss=args.local_loss,
             gather_with_grad=args.gather_with_grad,

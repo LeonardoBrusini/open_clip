@@ -88,8 +88,13 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         if not args.skip_scheduler:
             scheduler(step)
-
-        images, texts = batch
+        
+        if args.precomp_distill:
+            images, texts, dist_image_features, dist_text_features = batch
+            dist_image_features = dist_image_features.to(device=device, dtype=input_dtype, non_blocking=True)
+            dist_text_features = dist_text_features.to(device=device, dtype=input_dtype, non_blocking=True)
+        else:
+            images, texts = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
 
@@ -104,6 +109,10 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
+                elif args.precomp_distill:
+                    model_out["dist_image_features"] = dist_image_features
+                    model_out["dist_text_features"] = dist_text_features
+                    model_out["dist_logit_scale"] = 100.0
                 losses = loss(**model_out, output_dict=True)
 
                 total_loss = sum(losses.values())
@@ -289,7 +298,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                     logit_scale = logit_scale.mean()
                     logits_per_image = logit_scale * image_features @ text_features.t()
                     logits_per_text = logits_per_image.t()
-
+                
                     batch_size = images.shape[0]
                     labels = torch.arange(batch_size, device=device).long()
                     total_loss = (

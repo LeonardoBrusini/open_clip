@@ -61,7 +61,7 @@ def parse_args(args):
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto"],
+        choices=["webdataset", "csv", "synthetic", "auto", "distillation-csv"],
         default="auto",
         help="Which type of dataset to process."
     )
@@ -475,6 +475,38 @@ def parse_args(args):
         type=str,
         help='A string to specify a specific distributed loss implementation.'
     )
+
+    parser.add_argument(
+        "--precomp-distill",
+        default=False,
+        action="store_true",
+        help='Use pre-computed teacher features for distillation.'
+    )
+    parser.add_argument(
+        "--base-folder",
+        default=None,
+        type=str,
+        help="Base folder for the training images. Used for csv and distillation-csv datasets."
+    )
+    parser.add_argument(
+        "--val-base-folder",
+        default=None,
+        type=str,
+        help="Base folder for the validation images. Used for csv and distillation-csv datasets."
+    )
+    parser.add_argument(
+        "--early-stop",
+        default=False,
+        action="store_true",
+        help="If true, stop training if top-1 imagenet val accuracy is not improving after '--patience' epochs."
+    )
+    parser.add_argument(
+        "--patience",
+        default=10,
+        type=int,
+        help="Number of epochs to wait before stopping training if no improvement in top-1 imagenet val accuracy."
+    )
+
 
     args = parser.parse_args(args)
 
