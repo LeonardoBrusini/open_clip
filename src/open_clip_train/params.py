@@ -1,7 +1,6 @@
 import argparse
 import ast
 
-
 def get_default_params(model_name):
     # Params from paper (https://arxiv.org/pdf/2103.00020.pdf)
     model_name = model_name.lower()
@@ -9,7 +8,6 @@ def get_default_params(model_name):
         return {"lr": 5.0e-4, "beta1": 0.9, "beta2": 0.98, "eps": 1.0e-6}
     else:
         return {"lr": 5.0e-4, "beta1": 0.9, "beta2": 0.999, "eps": 1.0e-8}
-
 
 class ParseKwargs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
@@ -21,7 +19,6 @@ class ParseKwargs(argparse.Action):
             except ValueError:
                 kw[key] = str(value)  # fallback to string (avoid need to escape on command line)
         setattr(namespace, self.dest, kw)
-
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -61,7 +58,7 @@ def parse_args(args):
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto", "distillation-csv"],
+        choices=["webdataset", "csv", "synthetic", "auto", "distillation-csv", "multi-image-csv"],
         default="auto",
         help="Which type of dataset to process."
     )
@@ -489,6 +486,13 @@ def parse_args(args):
         help="Base folder for the training images. Used for csv and distillation-csv datasets."
     )
     parser.add_argument(
+        "--image-subfolders",
+        default=None,
+        type=str,
+        nargs='+',
+        help="List of subfolders containing image variations."
+    )
+    parser.add_argument(
         "--val-base-folder",
         default=None,
         type=str,
@@ -506,7 +510,6 @@ def parse_args(args):
         type=int,
         help="Number of epochs to wait before stopping training if no improvement in top-1 imagenet val accuracy."
     )
-
 
     args = parser.parse_args(args)
 

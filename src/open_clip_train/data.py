@@ -8,6 +8,8 @@ import sys
 import braceexpand
 from dataclasses import dataclass
 from multiprocessing import Value
+import time
+from typing import Optional, Iterator
 
 import numpy as np
 import pandas as pd
@@ -15,7 +17,7 @@ import torch
 import torchvision.datasets as datasets
 import webdataset as wds
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info, Sampler, BatchSampler
 from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
@@ -24,7 +26,6 @@ try:
     import horovod.torch as hvd
 except ImportError:
     hvd = None
-
 
 class CsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
@@ -51,6 +52,175 @@ class CsvDataset(Dataset):
         images = self.transforms(Image.open(os.path.join(self.base_dir, str(self.images[idx]))))
         texts = self.tokenize([str(self.captions[idx])])[0]
         return images, texts
+
+class MultiImageCsvDataset(Dataset):
+    """
+        Dataset for CSV files with captions and relative image paths, but with multiple image variations per caption.
+        Each image is stored in a subfolder, so for each caption there are m images stored in
+        subfolders[0]/df[image_key][idx], 
+        subfolders[1]/df[image_key][idx], etc.
+    """
+    def __init__(self, input_filename, transforms, img_key, caption_key, is_train, 
+                 base_folder, subfolders, sep="\t", tokenizer=None):
+        """
+        Args:
+            input_filename: Path to CSV file with n caption-image pairs
+            transforms: Image transforms to apply
+            img_key: Column name for image paths in CSV
+            caption_key: Column name for captions in CSV  
+            is_train: Training flag (for compatibility)
+            base_folder: Base directory containing subfolders
+            subfolders: List of subfolder names, each containing image variations
+            sep: CSV separator
+            tokenizer: Text tokenizer
+        """
+        logging.debug(f'Loading csv data from {input_filename}.')
+        df = pd.read_csv(input_filename, sep=sep)
+        
+        # Original n caption-image pairs
+        self.original_images = df[img_key].tolist()
+        self.original_captions = df[caption_key].tolist()
+        self.transforms = transforms
+        self.tokenize = tokenizer
+        self.base_dir = base_folder
+        self.subfolders = subfolders
+        
+        # Create expanded dataset: n*m items total
+        self.images = []
+        self.captions = []
+        self.caption_ids = []  # To track which original caption this belongs to
+        
+        print(f'Loading {len(self.original_captions)} captions with {len(subfolders)} variations each.')
+        for caption_idx, (original_image, caption) in enumerate(zip(self.original_images, self.original_captions)):
+            for subfolder in subfolders:
+                # Full path for this image variation
+                image_path = os.path.join(self.base_dir, subfolder, str(original_image))
+                self.images.append(image_path)
+                self.captions.append(caption)
+                self.caption_ids.append(caption_idx)  # Track original caption index
+        print(f'Loaded {len(self.images)} total image-caption pairs.')
+
+        self.n = len(self.original_captions)  # Number of unique captions
+        self.m = len(subfolders)  # Number of variations per caption
+        
+        logging.debug(f'Done loading data. {self.n} unique captions with {self.m} variations each = {len(self)} total items.')
+    
+    def __len__(self):
+        # Return n*m (total number of image-caption pairs)
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        # Load and transform image
+        images = self.transforms(Image.open(self.images[idx]))
+        # Tokenize caption
+        texts = self.tokenize([str(self.captions[idx])])[0]
+        return images, texts
+    
+    def get_caption_id(self, idx):
+        """Get the original caption ID for a given dataset index"""
+        return self.caption_ids[idx]
+
+class MultiImageDistributedBatchSampler(BatchSampler):
+    """
+    BatchSampler for n captions x m variations, in distributed training.
+    Guarantees:
+      - No two samples in a batch share the same caption.
+      - All n*m indices are seen each epoch (modulo drop_last).
+      - Work is evenly sharded across `num_replicas`.
+    """
+    def __init__(self,
+                 dataset,
+                 batch_size: int,
+                 num_replicas: int = None,
+                 rank: int = None,
+                 shuffle: bool = True,
+                 drop_last: bool = False,
+                 seed: int = 0):
+        """
+        Args:
+          dataset: must have attributes `.n` (# captions) and `.m` (# per‑caption variations)
+          batch_size: batch size PER RANK
+          num_replicas, rank: from torch.distributed (or None for single‑GPU)
+          shuffle: whether to reshuffle each epoch
+          drop_last: if True, drop the final partial batch on each rank
+          seed: base seed
+        """
+        if num_replicas is None:
+            # fallback to 1‑GPU
+            num_replicas, rank = 1, 0
+        super().__init__(sampler=None, batch_size=batch_size, drop_last=drop_last)
+
+        self.n = dataset.n
+        self.m = dataset.m
+        self.batch_size = batch_size
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+        self.total_size = self.n * self.m
+
+    def __iter__(self):
+        logging.debug(f'BatchSampler epoch {self.epoch}')
+        # 1) Shuffle captions and their variations
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        caption_order = torch.randperm(self.n, generator=g).tolist() if self.shuffle else list(range(self.n))
+        queues = {
+            ci: (torch.randperm(self.m, generator=g).tolist() if self.shuffle else list(range(self.m)))
+            for ci in range(self.n)
+        }
+
+        # 2) Build the full interleaved list
+        all_indices = []
+        while any(queues.values()):
+            for ci in caption_order:
+                if queues[ci]:
+                    var = queues[ci].pop(0)
+                    all_indices.append(ci * self.m + var)
+
+        # 3) Pad to multiple of num_replicas
+        #    so that we can evenly slice
+        pad_len = (self.num_replicas - len(all_indices) % self.num_replicas) % self.num_replicas
+        if pad_len:
+            # simplest: repeat from the start
+            all_indices += all_indices[:pad_len]
+
+        # 4) Slice out this rank’s samples
+        rank_indices = all_indices[self.rank : len(all_indices) : self.num_replicas]
+
+        # 5) Chunk into batches
+        #    optionally pad the last batch if drop_last=False
+        batches = []
+        for i in range(0, len(rank_indices), self.batch_size):
+            batch = rank_indices[i : i + self.batch_size]
+            if len(batch) == self.batch_size:
+                batches.append(batch)
+            elif not self.drop_last:
+                # pad up to batch_size
+                pad = self.batch_size - len(batch)
+                batch += rank_indices[:pad]
+                batches.append(batch)
+
+        self.epoch += 1
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        # how many batches this rank will see
+        # total_rank_samples = ceil(self.total_size / num_replicas)
+        total_rank = math.ceil(self.total_size / self.num_replicas)
+        if self.drop_last:
+            return total_rank // self.batch_size
+        else:
+            return math.ceil(total_rank / self.batch_size)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Call at start of each epoch to reshuffle differently."""
+        self.epoch = epoch
 
 class DistillationCsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
@@ -515,6 +685,45 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
 
     return DataInfo(dataloader, sampler)
 
+def get_multi_image_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+    assert is_train, "Multi-image dataset is only supported for training. The validation should be done with a regular CSV dataset."
+    input_filename = args.train_data
+    base_folder = args.base_folder
+    image_subfolders = args.image_subfolders
+    assert input_filename
+    dataset = MultiImageCsvDataset(
+        input_filename,
+        preprocess_fn,
+        img_key=args.csv_img_key,
+        caption_key=args.csv_caption_key,
+        is_train=is_train,
+        base_folder=base_folder,
+        subfolders=image_subfolders,  # list of subfolders with image variations
+        sep=args.csv_separator,
+        tokenizer=tokenizer
+    )
+    num_samples = len(dataset)
+    sampler = MultiImageDistributedBatchSampler(
+        dataset,
+        batch_size=args.batch_size,
+        num_replicas=torch.distributed.get_world_size(),
+        rank=torch.distributed.get_rank(),
+        shuffle=is_train,
+        drop_last=is_train,
+        seed=args.seed
+    ) if args.distributed and is_train else None
+    shuffle = is_train and sampler is None
+    dataloader = DataLoader(
+        dataset,
+        num_workers=args.workers,
+        pin_memory=True,
+        batch_sampler=sampler
+    )
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
 def get_distilled_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data
     assert input_filename
@@ -606,6 +815,10 @@ def get_dataset_fn(data_path, dataset_type):
         return get_csv_dataset
     elif dataset_type == "synthetic":
         return get_synthetic_dataset
+    elif dataset_type == "multi-image-csv":
+        if "val" in data_path:
+            return get_csv_dataset
+        return get_multi_image_csv_dataset
     elif dataset_type == "auto":
         ext = data_path.split('.')[-1]
         if ext in ['csv', 'tsv']:
@@ -638,3 +851,119 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
         data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")
 
     return data
+
+# ---- TESTING GPT generated ----
+'''def create_mock_dataset(n_captions=100, m_variations=4, image_size=(32, 32)):
+    tmp_dir = tempfile.mkdtemp()
+    image_names = [f"img_{i}.jpg" for i in range(n_captions)]
+    captions = [f"caption {i}" for i in range(n_captions)]
+    subfolders = [f"var_{j}" for j in range(m_variations)]
+
+    # Create subfolders and dummy images
+    for sub in subfolders:
+        os.makedirs(os.path.join(tmp_dir, sub))
+        for name in image_names:
+            img_path = os.path.join(tmp_dir, sub, name)
+            Image.new("RGB", image_size).save(img_path)
+
+    # Create CSV
+    df = pd.DataFrame({
+        "image": image_names,
+        "caption": captions
+    })
+    csv_path = os.path.join(tmp_dir, "mock.csv")
+    df.to_csv(csv_path, sep="\t", index=False)
+
+    return tmp_dir, csv_path, subfolders, image_names, captions
+
+def dummy_tokenizer(texts):
+    return [torch.tensor([ord(c) for c in t[:5]]) for t in texts]
+
+def test_multi_image_csv_dataset():
+    base_dir, csv_path, subfolders, image_names, captions = create_mock_dataset(n_captions=4, m_variations=3)
+
+    transform = transforms.ToTensor()
+    dataset = MultiImageCsvDataset(
+        input_filename=csv_path,
+        transforms=transform,
+        img_key="image",
+        caption_key="caption",
+        is_train=True,
+        base_folder=base_dir,
+        subfolders=subfolders,
+        sep="\t",
+        tokenizer=dummy_tokenizer
+    )
+
+    # 1. Dataset length should be n * m
+    assert len(dataset) == len(captions) * len(subfolders)
+
+    # 2. Each caption should appear m times
+    from collections import Counter
+    caption_ids = [dataset.get_caption_id(i) for i in range(len(dataset))]
+    counts = Counter(caption_ids)
+    assert all(v == len(subfolders) for v in counts.values())
+
+    # 3. All image paths must be valid
+    for path in dataset.images:
+        assert os.path.isfile(path), f"Missing image: {path}"
+
+    # 4. Check __getitem__
+    img, tokenized_caption = dataset[0]
+    assert isinstance(img, torch.Tensor) and img.ndim == 3
+    assert isinstance(tokenized_caption, torch.Tensor)
+
+    shutil.rmtree(base_dir)
+    print("✅ test_multi_image_csv_dataset passed.")
+
+def test_multi_image_batch_sampler():
+    base_dir, csv_path, subfolders, image_names, captions = create_mock_dataset(n_captions=5, m_variations=2)
+
+    transform = transforms.ToTensor()
+    dataset = MultiImageCsvDataset(
+        input_filename=csv_path,
+        transforms=transform,
+        img_key="image",
+        caption_key="caption",
+        is_train=True,
+        base_folder=base_dir,
+        subfolders=subfolders,
+        sep="\t",
+        tokenizer=dummy_tokenizer
+    )
+
+    batch_size = 2
+    sampler = MultiImageDistributedBatchSampler(
+        dataset=dataset,
+        batch_size=batch_size,
+        num_replicas=1,
+        rank=0,
+        shuffle=False,
+        drop_last=False
+    )
+
+    all_indices = []
+    for batch in sampler:
+        # 5. Ensure unique caption IDs within each batch
+        caption_ids = [dataset.get_caption_id(i) for i in batch]
+        assert len(set(caption_ids)) == len(caption_ids), f"Duplicate captions in batch: {caption_ids}"
+        all_indices.extend(batch)
+
+    # 6. Ensure all indices were covered
+    assert sorted(all_indices) == sorted(list(range(len(dataset))))
+
+    print("✅ test_multi_image_batch_sampler passed.")
+    shutil.rmtree(base_dir)
+
+if __name__ == "__main__":
+    import os
+    import tempfile
+    import shutil
+    import pandas as pd
+    import torch
+    from PIL import Image
+    from torchvision import transforms
+    from torch.utils.data import DataLoader
+    from types import SimpleNamespace
+    test_multi_image_csv_dataset()
+    test_multi_image_batch_sampler()'''
