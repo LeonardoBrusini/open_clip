@@ -64,6 +64,14 @@ def gather_features(
 
     return all_image_features, all_text_features
 
+def concat_all_gather(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Performs all_gather operation on the provided tensor across all processes.
+    """
+    world_size = dist.get_world_size()
+    tensors_gather = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(tensors_gather, tensor)
+    return torch.cat(tensors_gather, dim=0)
 
 class ClipLoss(nn.Module):
 
@@ -149,6 +157,74 @@ class ClipLoss(nn.Module):
 
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
+
+def compute_cross_entropy(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    log_q = F.log_softmax(q, dim=-1)
+    return -(p * log_q).sum(dim=-1).mean()
+
+class MultiCLIPLoss(ClipLoss):
+    def __init__(
+        self,
+        m: int,
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
+        use_horovod=False,
+    ):
+        super().__init__(
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod,
+        )
+        self.m = m
+
+    def get_ground_truth(self, device: torch.device, num_logits: int) -> torch.Tensor:
+        if self.prev_num_logits != num_logits or device not in self.labels:
+            local_idx = torch.arange(num_logits, device=device)
+            if self.local_loss and self.world_size > 1:
+                local_idx += self.rank * num_logits
+            all_idx = concat_all_gather(local_idx)
+            group_local = local_idx // self.m
+            group_all = all_idx // self.m
+            mask = group_local.unsqueeze(1) == group_all.unsqueeze(0)
+            labels = mask.float().div(mask.sum(1, keepdim=True).clamp(min=1.0))
+            if self.cache_labels:
+                self.labels[device] = labels
+                self.prev_num_logits = num_logits
+            return labels
+        else:
+            return self.labels[device]
+
+    def forward(
+            self,
+            image_features: torch.Tensor,
+            text_features: torch.Tensor,
+            logit_scale: torch.Tensor,
+            logit_bias: torch.Tensor = None,
+            output_dict: bool = False,
+    ):
+        logits_per_image, logits_per_text = self.get_logits(
+            image_features, text_features, logit_scale, logit_bias
+        )
+        #print(f"Logits per image:\n{logits_per_image.shape}")
+        #print(f"Logits per text:\n{logits_per_text.shape}")
+
+        # Determine batch size for ground-truth
+        gt = self.get_ground_truth(image_features.device, logits_per_image.shape[0])
+        #print(f"Ground truth p at rank {self.rank}:\n{gt.cpu().numpy()}")
+
+        loss_i2t = compute_cross_entropy(gt, logits_per_image)
+        loss_t2i = compute_cross_entropy(gt, logits_per_text)
+        total_loss = (loss_i2t + loss_t2i) / 2
+        
+        if output_dict:
+            return {"mp_contrast_loss": total_loss}
+        return total_loss
 
 class CoCaLoss(ClipLoss):
     def __init__(
@@ -457,3 +533,70 @@ class SigLipLoss(nn.Module):
                 assert False
 
         return {"contrastive_loss": loss} if output_dict else loss
+
+# ------ TESTING -------
+'''import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+# === Mockup Example ===
+def run_demo(rank, world_size, backend='gloo'):
+    import numpy as np
+    import sys
+    np.set_printoptions(precision=2, threshold=sys.maxsize, linewidth=sys.maxsize)
+    """
+    Demo for a distributed setup. Launch this via torch.multiprocessing.spawn.
+    """
+    dist.init_process_group(
+        backend=backend,
+        init_method='tcp://127.0.0.1:29500',
+        rank=rank,
+        world_size=world_size
+    )
+
+    if world_size > 1:
+        local_loss = True
+        gather_with_grad = True
+    else:
+        local_loss = False
+        gather_with_grad = False
+
+    # Hyperparameters
+    batch_size = 32  # per-process
+    feature_dim = 32
+    m = 4  # multi-positive group size
+
+    # Generate random features (seeded differently per rank)
+    torch.manual_seed(42 + rank)
+    image_feats = torch.randn(batch_size, feature_dim, device=rank)
+    text_feats = torch.randn(batch_size, feature_dim, device=rank)
+    logit_scale = torch.tensor(1.0, device=rank)
+
+    # Instantiate loss
+    loss_fn = MultiCLIPLoss(m=m, local_loss=local_loss, world_size=world_size, rank=rank)
+
+    # Forward logic identical to loss forward
+    img = F.normalize(image_feats, dim=-1)
+    txt = F.normalize(text_feats, dim=-1)
+
+    loss = loss_fn(
+        image_features=img,
+        text_features=txt,
+        logit_scale=torch.tensor([1.0], device=rank).item(),
+    )
+    print(f"Rank {rank} Total Loss: {loss}")
+
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    import torch.multiprocessing as mp
+
+    world_size = 1
+    # spawn two processes (make sure your system supports GPUs or use cpu)
+    mp.spawn(
+        run_demo,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True
+    )'''
