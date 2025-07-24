@@ -53,6 +53,68 @@ class CsvDataset(Dataset):
         texts = self.tokenize([str(self.captions[idx])])[0]
         return images, texts
 
+class MultiCLIPCsvDataset(Dataset):
+    def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, subfolders, sep="\t", tokenizer=None):
+        logging.info(f'Loading csv data from {input_filename}.')
+        df = pd.read_csv(input_filename, sep=sep)
+
+        self.relative_paths = df[img_key].tolist()
+        self.captions = df[caption_key].tolist()
+        self.transforms = transforms
+        self.tokenize = tokenizer
+        self.base_dir = base_folder
+        self.subfolders = subfolders
+        self.m = len(subfolders)
+        logging.info(f"Loaded {len(self.captions)} unique captions with {self.m} views each. Each epoch will thus yield {len(self.captions) * self.m} samples.")
+
+    def __len__(self):
+        return len(self.captions)
+
+    def __getitem__(self, idx):
+        #images = self.transforms(Image.open(str(self.images[idx])))
+        images = self.transforms(Image.open(os.path.join(self.base_dir, str(self.images[idx]))))
+        texts = self.tokenize([str(self.captions[idx])])[0]
+        return images, texts
+    
+    def __getitem__(self, idx):
+        rel_path = self.relative_paths[idx]
+        caption = self.captions[idx]
+        
+        images = []
+        texts = []
+
+        for sub in self.subfolders:
+            full_path = os.path.join(self.base_dir, sub, rel_path)
+            image = self.transforms(Image.open(full_path))
+            images.append(image)
+            texts.append(self.tokenize([str(caption)])[0])
+
+        return images, texts  # length m each
+    
+def multi_positive_collate_fn(batch):
+    """
+    Collate function for multi-positive loss CLIP training.
+    Args:
+        batch: List of size n_captions_per_batch.
+               Each element is a tuple: (List[image_tensor], List[text_tensor]) of length m.
+    Returns:
+        Tuple of:
+          - images: Tensor of shape (n * m, C, H, W)
+          - texts: Tensor of shape (n * m, seq_len)
+    """
+    images = []
+    texts = []
+
+    for img_list, txt_list in batch:
+        images.extend(img_list)  # list of m image tensors
+        texts.extend(txt_list)   # list of m tokenized caption tensors
+
+    # Stack into batch tensors
+    images = torch.stack(images, dim=0)
+    texts = torch.stack(texts, dim=0)
+
+    return images, texts
+
 class MultiImageCsvDataset(Dataset):
     """
         Dataset for CSV files with captions and relative image paths, but with multiple image variations per caption.
@@ -685,6 +747,44 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
 
     return DataInfo(dataloader, sampler)
 
+def get_multi_clip_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+    assert is_train, "Multi-CLIP dataset is only supported for training. The validation should be done with a regular CSV dataset."
+    input_filename = args.train_data
+    base_folder = args.base_folder
+    subfolders = args.image_subfolders
+
+    dataset = MultiCLIPCsvDataset(
+        input_filename=input_filename,
+        transforms=preprocess_fn,
+        img_key=args.csv_img_key,
+        caption_key=args.csv_caption_key,
+        is_train=is_train,
+        base_folder=base_folder,
+        subfolders=subfolders,
+        sep=args.csv_separator,
+        tokenizer=tokenizer
+    )
+
+    num_samples = len(dataset)
+    sampler = DistributedSampler(dataset) if args.distributed and is_train else None
+    shuffle = is_train and sampler is None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,  # n = number of captions per batch
+        shuffle=shuffle,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=is_train,
+        collate_fn=multi_positive_collate_fn  # <- custom collate function
+    )
+
+    dataloader.num_samples = num_samples * len(subfolders)  # actual #samples per epoch
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
 def get_multi_image_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     assert is_train, "Multi-image dataset is only supported for training. The validation should be done with a regular CSV dataset."
     input_filename = args.train_data
@@ -819,6 +919,10 @@ def get_dataset_fn(data_path, dataset_type):
         if "val" in data_path:
             return get_csv_dataset
         return get_multi_image_csv_dataset
+    elif dataset_type == "multi-clip-csv":
+        if "val" in data_path:
+            return get_csv_dataset
+        return get_multi_clip_csv_dataset
     elif dataset_type == "auto":
         ext = data_path.split('.')[-1]
         if ext in ['csv', 'tsv']:
