@@ -64,6 +64,25 @@ def gather_features(
 
     return all_image_features, all_text_features
 
+def gather_image_features(
+        image_features,
+        local_loss=False,
+        gather_with_grad=False,
+        rank=0,
+        world_size=1
+):
+    # We gather tensors from all gpus
+    if gather_with_grad:
+        all_image_features = torch.cat(torch.distributed.nn.all_gather(image_features), dim=0)
+    else:
+        gathered_image_features = [torch.zeros_like(image_features) for _ in range(world_size)]
+        dist.all_gather(gathered_image_features, image_features)
+        if not local_loss:
+            # ensure grads for local rank when all_* features don't have a gradient
+            gathered_image_features[rank] = image_features
+        all_image_features = torch.cat(gathered_image_features, dim=0)
+    return all_image_features
+
 def concat_all_gather(tensor: torch.Tensor) -> torch.Tensor:
     """
     Performs all_gather operation on the provided tensor across all processes.
@@ -122,8 +141,8 @@ class ClipLoss(nn.Module):
             )
 
             if self.local_loss:
-                logits_per_image = logit_scale * image_features @ all_text_features.T
-                logits_per_text = logit_scale * text_features @ all_image_features.T
+                logits_per_image = logit_scale * image_features @ all_text_features.T # for MultiCLIP: e.g. if m=4, then logits_per_image is 16x4
+                logits_per_text = logit_scale * text_features @ all_image_features.T # for MultiCLIP: e.g. if m=4, then logits_per_text is 4x16
             else:
                 logits_per_image = logit_scale * all_image_features @ all_text_features.T
                 logits_per_text = logits_per_image.T
@@ -183,22 +202,48 @@ class MultiCLIPLoss(ClipLoss):
         )
         self.m = m
 
-    def get_ground_truth(self, device: torch.device, num_logits: int) -> torch.Tensor:
+    def get_ground_truth(self, device: torch.device, num_logits: int):
+        """
+        Returns:
+          - labels_t2i: soft labels for text-to-image, shape [n, n*m*world_size]
+          - labels_i2t: one-hot labels for image-to-text, shape [n*m, n*world_size]
+
+        `num_logits` is the number of captions (n).
+        """
+        # Check cache
         if self.prev_num_logits != num_logits or device not in self.labels:
-            local_idx = torch.arange(num_logits, device=device)
-            if self.local_loss and self.world_size > 1:
-                local_idx += self.rank * num_logits
-            all_idx = concat_all_gather(local_idx)
-            group_local = local_idx // self.m
-            group_all = all_idx // self.m
-            mask = group_local.unsqueeze(1) == group_all.unsqueeze(0)
-            labels = mask.float().div(mask.sum(1, keepdim=True).clamp(min=1.0))
+            n = num_logits
+            m = self.m
+            ws = self.world_size
+            r  = self.rank
+
+            # Caption indices
+            cap_idx = torch.arange(n, device=device) + r * n                  # [n]
+            all_cap_idx = concat_all_gather(cap_idx)                         # [n*world_size]
+
+            # Image indices
+            num_img = n * m
+            img_idx = torch.arange(num_img, device=device) + r * num_img     # [n*m]
+            all_img_idx = concat_all_gather(img_idx)                         # [n*m*world_size]
+
+            # Text-to-Image soft labels
+            img_group = all_img_idx // m                                      # [n*m*world_size]
+            mask_t2i = cap_idx.unsqueeze(1) == img_group.unsqueeze(0)         # [n, n*m*world_size]
+            labels_t2i = mask_t2i.float().div(mask_t2i.sum(1, keepdim=True).clamp(min=1.0))
+
+            # Image-to-Text one-hot labels
+            img_to_cap = img_idx // m                                         # [n*m]
+            mask_i2t = img_to_cap.unsqueeze(1) == all_cap_idx.unsqueeze(0)     # [n*m, n*world_size]
+            labels_i2t = mask_i2t.float()
+
+            # Cache
             if self.cache_labels:
-                self.labels[device] = labels
+                self.labels[device] = (labels_t2i, labels_i2t)
                 self.prev_num_logits = num_logits
-            return labels
-        else:
-            return self.labels[device]
+            else:
+                return (labels_t2i, labels_i2t)
+        # Return from cache or newly computed
+        return self.labels[device]
 
     def forward(
             self,
@@ -206,7 +251,7 @@ class MultiCLIPLoss(ClipLoss):
             text_features: torch.Tensor,
             logit_scale: torch.Tensor,
             logit_bias: torch.Tensor = None,
-            output_dict: bool = False,
+            output_dict: bool = False
     ):
         logits_per_image, logits_per_text = self.get_logits(
             image_features, text_features, logit_scale, logit_bias
@@ -215,16 +260,136 @@ class MultiCLIPLoss(ClipLoss):
         #print(f"Logits per text:\n{logits_per_text.shape}")
 
         # Determine batch size for ground-truth
-        gt = self.get_ground_truth(image_features.device, logits_per_image.shape[0])
-        #print(f"Ground truth p at rank {self.rank}:\n{gt.cpu().numpy()}")
+        gt_t2i, gt_i2t = self.get_ground_truth(image_features.device, logits_per_text.shape[0])
+        #print(f"Ground truth t2i at rank {self.rank} with shape {gt_t2i.shape}:\n{gt_t2i.cpu().numpy()}")
+        #print(f"Ground truth i2t at rank {self.rank} with shape {gt_i2t.shape}:\n{gt_i2t.cpu().numpy()}")
 
-        loss_i2t = compute_cross_entropy(gt, logits_per_image)
-        loss_t2i = compute_cross_entropy(gt, logits_per_text)
+        loss_i2t = compute_cross_entropy(gt_i2t, logits_per_image)
+        loss_t2i = compute_cross_entropy(gt_t2i, logits_per_text)
         total_loss = (loss_i2t + loss_t2i) / 2
         
         if output_dict:
             return {"mp_contrast_loss": total_loss}
         return total_loss
+
+class StableRepPlusLoss(MultiCLIPLoss):
+    def __init__(
+        self,
+        m: int = 4,
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
+        use_horovod=False,
+    ):
+        super().__init__(
+            m=m,
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod
+        )
+        self.stablerep_prev_num_logits = 0
+        self.stablerep_labels = {}
+
+    def get_stablerep_logits(self, image_features, logit_scale=10, logit_bias=None):
+        if self.world_size > 1:
+            all_image_features = gather_image_features(
+                image_features,
+                local_loss=self.local_loss,
+                gather_with_grad=self.gather_with_grad,
+                rank=self.rank,
+                world_size=self.world_size
+            )
+
+            # StableRep originally uses a FIXED temperature of 0.1 and devides the logits, which is equivalent to multiplying by 10
+            # Thus here we use a logit_scale of 10 to match the original StableRep implementation
+
+            if self.local_loss:
+                logits = logit_scale * image_features @ all_image_features.T
+            else:
+                logits = logit_scale * all_image_features @ all_image_features.T
+        else:
+            logits = logit_scale * image_features @ image_features.T
+
+        if logit_bias is not None:
+            logits += logit_bias
+
+        return logits
+
+    def get_stablerep_ground_truth(self, device: torch.device, num_logits: int) -> torch.Tensor:
+        if self.stablerep_prev_num_logits != num_logits or device not in self.stablerep_labels:
+            local_idx = torch.arange(num_logits, device=device)
+            if self.local_loss and self.world_size > 1:
+                local_idx += self.rank * num_logits
+            all_idx = concat_all_gather(local_idx)
+            group_local = local_idx // self.m
+            group_all = all_idx // self.m
+            mask = group_local.unsqueeze(1) == group_all.unsqueeze(0)
+            # self-mask is used to exclude self-comparisons
+            if self.local_loss:
+                # self-mask is used to exclude self-comparisons in the global matrix
+                logits_range = torch.arange(num_logits, device=device)
+                global_idx = self.rank * num_logits + logits_range
+                mask[logits_range, global_idx] = False
+            else:
+                mask.fill_diagonal_(0)
+            labels = mask.float().div(mask.sum(1, keepdim=True).clamp(min=1.0))
+            if self.cache_labels:
+                self.stablerep_labels[device] = labels
+                self.stablerep_prev_num_logits = num_logits
+            return labels
+        else:
+            return self.stablerep_labels[device]
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        logit_scale: torch.Tensor,
+        logit_bias: torch.Tensor = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        output_dict: bool = False
+    ):
+        multiclip_loss = super().forward(
+            image_features=image_features,
+            text_features=text_features,
+            logit_scale=logit_scale,
+            logit_bias=logit_bias,
+            output_dict=False
+        )
+
+        #print(f"Using provided image embeddings for StableRep loss at rank {self.rank}.")
+        logits = self.get_stablerep_logits(
+            image_features=image_embeddings,
+            logit_bias=logit_bias
+        ) # note: logit_scale is not used here, as StableRep uses a fixed temperature of 0.1
+
+        dtype = logits.dtype
+        min_val = -torch.finfo(dtype).max  # most negative representable value
+        safe_val = min_val / 10            # avoid edge-of-range numerical instability
+
+        if self.local_loss:
+            # Explicitly mask out each local sample's self‐comparison in the global matrix
+            B = logits.size(0)
+            b_arange = torch.arange(B, device=image_features.device)
+            global_idx = self.rank * B + b_arange
+            logits[b_arange, global_idx] = safe_val
+        else:
+            logits.fill_diagonal_(safe_val)  # Avoid self-comparisons in StableRep
+        gt = self.get_stablerep_ground_truth(image_features.device, logits.shape[0])
+        #print(f"StableRep ground truth p at rank {self.rank}:\n{gt.cpu().numpy()}")
+        stablerep_loss = compute_cross_entropy(gt, logits)
+
+        if output_dict:
+            return {
+                "mp_contrast_loss": multiclip_loss,
+                "stable_rep_loss": stablerep_loss
+            }
+        return multiclip_loss, stablerep_loss
 
 class CoCaLoss(ClipLoss):
     def __init__(
@@ -535,19 +700,12 @@ class SigLipLoss(nn.Module):
         return {"contrastive_loss": loss} if output_dict else loss
 
 # ------ TESTING -------
-'''import torch
-import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
-
 # === Mockup Example ===
 def run_demo(rank, world_size, backend='gloo'):
     import numpy as np
     import sys
     np.set_printoptions(precision=2, threshold=sys.maxsize, linewidth=sys.maxsize)
-    """
-    Demo for a distributed setup. Launch this via torch.multiprocessing.spawn.
-    """
+
     dist.init_process_group(
         backend=backend,
         init_method='tcp://127.0.0.1:29500',
@@ -563,40 +721,63 @@ def run_demo(rank, world_size, backend='gloo'):
         gather_with_grad = False
 
     # Hyperparameters
-    batch_size = 32  # per-process
+    batch_size = 4  # per-process
     feature_dim = 32
-    m = 4  # multi-positive group size
+    m = 2  # multi-positive group size
 
     # Generate random features (seeded differently per rank)
     torch.manual_seed(42 + rank)
-    image_feats = torch.randn(batch_size, feature_dim, device=rank)
+    image_feats = torch.randn(batch_size*m, feature_dim, device=rank)
     text_feats = torch.randn(batch_size, feature_dim, device=rank)
     logit_scale = torch.tensor(1.0, device=rank)
 
-    # Instantiate loss
-    loss_fn = MultiCLIPLoss(m=m, local_loss=local_loss, world_size=world_size, rank=rank)
-
-    # Forward logic identical to loss forward
+    # === Normalize Features ===
     img = F.normalize(image_feats, dim=-1)
     txt = F.normalize(text_feats, dim=-1)
 
-    loss = loss_fn(
+    # === MultiCLIPLoss ===
+    multiclip = MultiCLIPLoss(
+        m=m,
+        local_loss=local_loss,
+        gather_with_grad=gather_with_grad,
+        world_size=world_size,
+        rank=rank
+    )
+    multiclip_loss = multiclip(
         image_features=img,
         text_features=txt,
-        logit_scale=torch.tensor([1.0], device=rank).item(),
+        logit_scale=logit_scale.item()
     )
-    print(f"Rank {rank} Total Loss: {loss}")
+    print(f"[Rank {rank}] MultiCLIP Loss: {multiclip_loss.item():.4f}")
+
+    # === StableRepPlusLoss ===
+    stab_loss_fn = StableRepPlusLoss(
+        m=m,
+        local_loss=local_loss,
+        gather_with_grad=gather_with_grad,
+        world_size=world_size,
+        rank=rank
+    )
+    stable_loss_dict = stab_loss_fn(
+        image_features=img,
+        text_features=txt,
+        logit_scale=logit_scale.item(),
+        output_dict=True
+    )
+    print(f"[Rank {rank}] StableRepPlusLoss:")
+    for k, v in stable_loss_dict.items():
+        print(f"  {k}: {v.item():.4f}")
 
     dist.destroy_process_group()
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
 
-    world_size = 1
+    world_size = 2
     # spawn two processes (make sure your system supports GPUs or use cpu)
     mp.spawn(
         run_demo,
         args=(world_size,),
         nprocs=world_size,
         join=True
-    )'''
+    )

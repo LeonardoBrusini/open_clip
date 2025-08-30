@@ -58,7 +58,7 @@ def parse_args(args):
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto", "distillation-csv", "multi-image-csv", "multi-clip-csv"],
+        choices=["webdataset", "csv", "synthetic", "auto", "distillation-csv", "multi-positive-csv", "hn-csv"],
         default="auto",
         help="Which type of dataset to process."
     )
@@ -510,7 +510,20 @@ def parse_args(args):
         type=int,
         help="Number of epochs to wait before stopping training if no improvement in top-1 imagenet val accuracy."
     )
-
+    parser.add_argument(
+        "--stablerep-plus",
+        default=False,
+        action="store_true",
+        help="Use Stablerep+ loss for training. Can't be used if views_per_caption is set to 1."
+    )
+    parser.add_argument(
+        "--views-per-caption",
+        default=1,
+        type=int,
+        help="Number of views per caption."
+    )
+    
+    
     args = parser.parse_args(args)
 
     if 'timm' not in args.opt:

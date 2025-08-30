@@ -12,9 +12,9 @@ import torch
 
 from .convert import convert_state_dict
 from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
-    resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg
+    resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg, StableRepPlus
 from .coca_model import CoCa
-from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, MultiCLIPLoss
+from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss, MultiCLIPLoss, StableRepPlusLoss
 from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrained,\
     list_pretrained_tags_by_model, download_pretrained_from_hf
 from .transform import image_transform_v2, AugmentationCfg, PreprocessCfg, merge_preprocess_dict, merge_preprocess_kwargs
@@ -349,7 +349,12 @@ def create_model(
         else:
             model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
     else:
-        model = CLIP(**model_cfg, cast_dtype=cast_dtype)
+        if 'stablerep_plus' in model_name.lower():
+            # StableRepPlus model
+            logging.info(f'Creating StableRepPlus model {model_name}.')
+            model = StableRepPlus(**model_cfg, cast_dtype=cast_dtype)
+        else:
+            model = CLIP(**model_cfg, cast_dtype=cast_dtype)
 
     if precision in ("fp16", "bf16"):
         dtype = torch.float16 if 'fp16' in precision else torch.bfloat16
@@ -431,6 +436,10 @@ def create_model(
 
 
 def create_loss(args):
+    if args.stablerep_plus:
+        assert args.views_per_caption > 1, "StableRep+ requires multiple views per caption."
+        assert args.dataset_type == "multi-positive-csv", "StableRep+ is only supported for multi-positive-csv dataset."
+
     if args.distill or args.precomp_distill:
         return DistillClipLoss(
             local_loss=args.local_loss,
@@ -440,9 +449,19 @@ def create_loss(args):
             world_size=args.world_size,
             use_horovod=args.horovod,
         )
-    elif "multi-clip-csv" in args.dataset_type:
+    elif "multi-positive-csv" in args.dataset_type and args.views_per_caption > 1:
+        if args.stablerep_plus:
+            return StableRepPlusLoss(
+                m=args.views_per_caption,
+                local_loss=args.local_loss,
+                gather_with_grad=args.gather_with_grad,
+                cache_labels=True,
+                rank=args.rank,
+                world_size=args.world_size,
+                use_horovod=args.horovod,
+            )
         return MultiCLIPLoss(
-            m=len(args.image_subfolders),
+            m=args.views_per_caption,
             local_loss=args.local_loss,
             gather_with_grad=args.gather_with_grad,
             cache_labels=True,

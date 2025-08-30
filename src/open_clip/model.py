@@ -236,10 +236,11 @@ class CLIP(nn.Module):
     ):
         super().__init__()
         self.output_dict = output_dict
-
+        
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
 
         text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+        self.text_output_dim = text.output_dim
         self.transformer = text.transformer
         self.context_length = text.context_length
         self.vocab_size = text.vocab_size
@@ -250,10 +251,11 @@ class CLIP(nn.Module):
         self.text_pool_type = text.pool_type
         self.register_buffer('attn_mask', text.attn_mask, persistent=False)
 
-        lshape = [1] if nonscalar_logit_scale else []
-        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
+        self.lshape = [1] if nonscalar_logit_scale else []
+        self.init_logit_scale = init_logit_scale
+        self.logit_scale = nn.Parameter(torch.ones(self.lshape) * init_logit_scale)
         if init_logit_bias is not None:
-            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
+            self.logit_bias = nn.Parameter(torch.ones(self.lshape) * init_logit_bias)
         else:
             self.logit_bias = None
 
@@ -429,6 +431,53 @@ class CLIP(nn.Module):
         if self.logit_bias is not None:
             return image_features, text_features, self.logit_scale.exp(), self.logit_bias
         return image_features, text_features, self.logit_scale.exp()
+
+class StableRepPlus(CLIP):
+    """ StableRepPlus model, a variant of CLIP with StableRep modifications.
+    See https://arxiv.org/abs/2309.13815 for details.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # StableRepPlus loss is made of 2 components.
+        # The StableRep component uses the output from the vision tower (will be called "image_embeddings") 
+        # The MultiCLIP component uses the output from the text tower ("text_features") and the projection of the "image_embeddings" in the dimension of the "text_features" (will be called "image_features").
+        self.image_proj = nn.Parameter(torch.randn(self.visual.output_dim, self.text_output_dim))
+    
+    def forward_intermediates(*args, **kwargs):
+        raise NotImplementedError("StableRepPlus does not support intermediate feature extraction.")
+    
+    def encode_image(self, image, normalize: bool = False):
+        embeddings = self.visual(image)
+        # Project image features to text feature space
+        features = embeddings @ self.image_proj
+        # Normalize both embeddings and projected features
+        if normalize:
+            features = F.normalize(features, dim=-1)
+            embeddings = F.normalize(embeddings, dim=-1)
+        return embeddings, features
+    
+    def forward(
+            self,
+            image: Optional[torch.Tensor] = None,
+            text: Optional[torch.Tensor] = None,
+    ):
+        image_embeddings, image_features = self.encode_image(image, normalize=True) if image is not None else (None, None)
+        text_features = self.encode_text(text, normalize=True) if text is not None else None
+
+        if self.output_dict:
+            out_dict = {
+                "image_embeddings": image_embeddings,
+                "image_features": image_features,
+                "text_features": text_features,
+                "logit_scale": self.logit_scale.exp()
+            }
+            if self.logit_bias is not None:
+                out_dict['logit_bias'] = self.logit_bias
+            return out_dict
+
+        if self.logit_bias is not None:
+            return image_embeddings, image_features, text_features, self.logit_scale.exp(), self.logit_bias
+        return image_embeddings, image_features, text_features, self.logit_scale.exp()
 
 
 class CustomTextCLIP(nn.Module):
