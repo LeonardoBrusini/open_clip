@@ -177,6 +177,56 @@ class ClipLoss(nn.Module):
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
+class HNClipLoss(ClipLoss):
+    '''
+    Hard Negative Weighted Contrastive Loss from https://arxiv.org/abs/2301.02280
+    '''
+    def __init__(self, alpha=1.0, beta=0.25, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(
+        self,
+        image_features,
+        text_features,
+        logit_scale,
+        logit_bias=None,
+        output_dict=False,
+    ):
+        device = image_features.device
+        logits_per_image, logits_per_text = self.get_logits(
+            image_features,
+            text_features,
+            logit_scale,
+            logit_bias=logit_bias,
+        )
+        n = logits_per_image.size(0)
+        # =====================
+        # Image-to-text loss
+        # =====================
+        weights_i2t = torch.exp(self.beta * logits_per_image)
+        weights_i2t.fill_diagonal_(0)
+        weights_i2t = (n - 1) * weights_i2t / weights_i2t.sum(dim=1, keepdim=True)
+        exp_sim_i2t = torch.exp(logits_per_image)
+        numerators = exp_sim_i2t.diag()
+        denominators = self.alpha * exp_sim_i2t.diag() + (exp_sim_i2t * weights_i2t).sum(dim=1)
+        loss_i2t = -torch.log(numerators / denominators).mean()
+        # =====================
+        # Text-to-image loss
+        # =====================
+        weights_t2i = torch.exp(self.beta * logits_per_text)
+        weights_t2i.fill_diagonal_(0)
+        weights_t2i = (n - 1) * weights_t2i / weights_t2i.sum(dim=1, keepdim=True)
+        exp_sim_t2i = torch.exp(logits_per_text)
+        numerators = exp_sim_t2i.diag()
+        denominators = self.alpha * exp_sim_t2i.diag() + (exp_sim_t2i * weights_t2i).sum(dim=1)
+        loss_t2i = -torch.log(numerators / denominators).mean()
+        
+        total_loss = (loss_i2t + loss_t2i) / 2
+        return {"hn_weighted_contrastive_loss": total_loss} if output_dict else total_loss
+
+
 def compute_cross_entropy(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     log_q = F.log_softmax(q, dim=-1)
     return -(p * log_q).sum(dim=-1).mean()
@@ -390,6 +440,115 @@ class StableRepPlusLoss(MultiCLIPLoss):
                 "stable_rep_loss": stablerep_loss
             }
         return multiclip_loss, stablerep_loss
+
+class TripletCLIPLoss(nn.Module):
+
+    def __init__(
+            self,
+            local_loss=False,
+            gather_with_grad=False,
+            cache_labels=False,
+            rank=0,
+            world_size=1,
+            use_horovod=False,
+    ):
+        super().__init__()
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        self.cache_labels = cache_labels
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+
+        # cache state
+        self.prev_num_logits = 0
+        self.labels = {}
+
+    def get_ground_truth(self, device, num_logits) -> torch.Tensor:
+        # calculated ground-truth and cache if enabled
+        if self.prev_num_logits != num_logits or device not in self.labels:
+            labels = torch.arange(num_logits, device=device, dtype=torch.long)
+            if self.world_size > 1 and self.local_loss:
+                labels = labels + num_logits * self.rank
+            if self.cache_labels:
+                self.labels[device] = labels
+                self.prev_num_logits = num_logits
+        else:
+            labels = self.labels[device]
+        return labels
+    
+    # negclip_loss and tripletclip_loss from original TripletCLIP implementation: https://github.com/tripletclip/TripletCLIP
+    # adapted to local loss computation
+    def negclip_loss(self, img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale):
+        # Normalize embeddings
+        batch_size = img_embs.shape[0]
+        labels = self.get_ground_truth(img_embs.device, batch_size)
+
+        img_text_similarity = logit_scale * img_embs @ all_text_embs.t()
+        text_img_similarity = logit_scale * text_embs @ all_img_embs.t()
+        img_negtext_similarity = logit_scale * img_embs @ all_neg_text_embs.t()
+
+        '''preds_i2t = torch.cat((img_text_similarity, img_negtext_similarity), dim=-1).argmax(
+            dim=-1
+        )
+        preds_t2i = img_text_similarity.t().argmax(dim=-1)
+        acc_i2t = (preds_i2t == labels).float().mean().item()
+        acc_t2i = (preds_t2i == labels).float().mean().item()
+        accuracy = (acc_i2t + acc_t2i) / 2'''
+
+        loss = (
+            F.cross_entropy(
+                torch.cat([img_text_similarity, img_negtext_similarity], dim=-1), labels
+            )
+            + F.cross_entropy(text_img_similarity, labels)
+        ).div(2)
+        return loss#, accuracy
+    
+    def tripletclip_loss(self, img_embs, text_embs, neg_img_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_img_embs, all_neg_text_embs, logit_scale):
+        # cross-type image negatives (base<-->hn) is NOT used in TripletCLIP, that's why i think it is not as good ad the usual clip loss
+        #loss_1, accuracy1 = self.negclip_loss(img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
+        #loss_2, accuracy2 = self.negclip_loss(neg_img_embs, neg_text_embs, text_embs, all_neg_img_embs, all_neg_text_embs, all_text_embs, logit_scale)
+        loss_1 = self.negclip_loss(img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
+        loss_2 = self.negclip_loss(neg_img_embs, neg_text_embs, text_embs, all_neg_img_embs, all_neg_text_embs, all_text_embs, logit_scale)
+
+        loss = loss_1 + loss_2
+        #accuracy = (accuracy1 + accuracy2) / 2
+        return loss#, accuracy
+
+    def forward(
+            self,
+            image_features,
+            text_features,
+            logit_scale,
+            logit_bias=None,
+            output_dict=False,
+    ):
+
+        if self.world_size > 1:
+            all_image_features, all_text_features = gather_features(
+                image_features, text_features,
+                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod
+            )
+        else:
+            all_image_features, all_text_features = image_features, text_features
+
+        img_embs, neg_img_embs = image_features[0::2], image_features[1::2]
+        text_embs, neg_text_embs = text_features[0::2], text_features[1::2]
+        all_img_embs, all_neg_img_embs = all_image_features[0::2], all_image_features[1::2]
+        all_text_embs, all_neg_text_embs = all_text_features[0::2], all_text_features[1::2]
+
+        # FINO A QUI OK
+        loss = self.tripletclip_loss(
+            img_embs, text_embs,
+            neg_img_embs, neg_text_embs,
+            all_img_embs, all_text_embs,
+            all_neg_img_embs, all_neg_text_embs,
+            logit_scale
+        )
+
+        if output_dict:
+            return {"tripletclip_loss": loss}
+        return loss
 
 class CoCaLoss(ClipLoss):
     def __init__(

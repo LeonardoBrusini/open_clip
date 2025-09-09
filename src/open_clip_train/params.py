@@ -522,6 +522,24 @@ def parse_args(args):
         type=int,
         help="Number of views per caption."
     )
+    parser.add_argument(
+        "--cap-subfolder",
+        default="cap",
+        type=str,
+        help="Subfolder for base images. Used in hn-csv dataset"
+    )
+    parser.add_argument(
+        "--hn-subfolder",
+        default="hn",
+        type=str,
+        help="Subfolder for hard negative images. Used in hn-csv dataset"
+    )
+    parser.add_argument(
+        "--tripletclip",
+        default=False,
+        action="store_true",
+        help="Use TripletCLIP loss for training. Only in combination with hn-csv dataset."
+    )
     
     
     args = parser.parse_args(args)

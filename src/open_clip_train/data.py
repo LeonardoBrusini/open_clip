@@ -54,11 +54,11 @@ class CsvDataset(Dataset):
         return images, texts
     
 class HNCsvDataset(Dataset):
-    def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
+    def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, cap_subfolder, hn_subfolder, sep="\t", tokenizer=None):
         logging.info(f'Loading csv data from {input_filename}.')
         df = pd.read_csv(input_filename, sep=sep)
-        self.cap_subfolder = "cap"
-        self.hn_subfolder = "hn_noseed"
+        self.cap_subfolder = cap_subfolder
+        self.hn_subfolder = hn_subfolder
         logging.info(f'Using caption subfolder: {self.cap_subfolder} |  Using HN subfolder: {self.hn_subfolder}')
         self.images = df[img_key].tolist()
         self.captions = df[caption_key].tolist()
@@ -696,6 +696,8 @@ def get_hn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
         caption_key=args.csv_caption_key,
         is_train=is_train,
         base_folder=base_folder,
+        cap_subfolder=args.cap_subfolder,
+        hn_subfolder=args.hn_subfolder,
         sep=args.csv_separator,
         tokenizer=tokenizer
     )
