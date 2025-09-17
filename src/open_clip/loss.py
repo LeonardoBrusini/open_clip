@@ -178,13 +178,14 @@ class ClipLoss(nn.Module):
 
 
 class HNClipLoss(ClipLoss):
-    '''
-    Hard Negative Weighted Contrastive Loss from https://arxiv.org/abs/2301.02280
-    '''
+    
+    #Hard Negative Weighted Contrastive Loss from https://arxiv.org/abs/2301.02280
+    
     def __init__(self, alpha=1.0, beta=0.25, **kwargs):
         super().__init__(**kwargs)
         self.alpha = alpha
         self.beta = beta
+        print(f"Using HNClipLoss (Implementation similar to DiHT formula) with alpha={self.alpha} and beta={self.beta}")
 
     def forward(
         self,
@@ -201,31 +202,38 @@ class HNClipLoss(ClipLoss):
             logit_scale,
             logit_bias=logit_bias,
         )
-        n = logits_per_image.size(0)
+        n_anchors, n_global = logits_per_image.shape
+        labels = self.get_ground_truth(device, n_anchors)  # length n_anchors
+        rows = torch.arange(n_anchors, device=device)
+        mask = torch.ones_like(logits_per_image, dtype=torch.bool)
+        mask[rows, labels] = False  # mask out the positive logits
+
         # =====================
         # Image-to-text loss
         # =====================
-        weights_i2t = torch.exp(self.beta * logits_per_image)
-        weights_i2t.fill_diagonal_(0)
-        weights_i2t = (n - 1) * weights_i2t / weights_i2t.sum(dim=1, keepdim=True)
         exp_sim_i2t = torch.exp(logits_per_image)
-        numerators = exp_sim_i2t.diag()
-        denominators = self.alpha * exp_sim_i2t.diag() + (exp_sim_i2t * weights_i2t).sum(dim=1)
+        weights_i2t = torch.exp(self.beta * logits_per_image)
+        weights_i2t = weights_i2t * mask  # zero out the positive logits
+
+        weights_i2t = (n_anchors - 1) * weights_i2t / weights_i2t.sum(dim=1, keepdim=True)
+        numerators = exp_sim_i2t[rows, labels]
+        denominators = self.alpha * numerators + (exp_sim_i2t * weights_i2t).sum(dim=1)
         loss_i2t = -torch.log(numerators / denominators).mean()
+
         # =====================
         # Text-to-image loss
         # =====================
-        weights_t2i = torch.exp(self.beta * logits_per_text)
-        weights_t2i.fill_diagonal_(0)
-        weights_t2i = (n - 1) * weights_t2i / weights_t2i.sum(dim=1, keepdim=True)
         exp_sim_t2i = torch.exp(logits_per_text)
-        numerators = exp_sim_t2i.diag()
-        denominators = self.alpha * exp_sim_t2i.diag() + (exp_sim_t2i * weights_t2i).sum(dim=1)
+        weights_t2i = torch.exp(self.beta * logits_per_text)
+        weights_t2i = weights_t2i * mask  # zero out the positive logits
+    
+        weights_t2i = (n_anchors - 1) * weights_t2i / weights_t2i.sum(dim=1, keepdim=True)
+        numerators = exp_sim_t2i[rows, labels]
+        denominators = self.alpha * numerators + (exp_sim_t2i * weights_t2i).sum(dim=1)
         loss_t2i = -torch.log(numerators / denominators).mean()
         
         total_loss = (loss_i2t + loss_t2i) / 2
         return {"hn_weighted_contrastive_loss": total_loss} if output_dict else total_loss
-
 
 def compute_cross_entropy(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     log_q = F.log_softmax(q, dim=-1)
@@ -858,85 +866,82 @@ class SigLipLoss(nn.Module):
 
         return {"contrastive_loss": loss} if output_dict else loss
 
-# ------ TESTING -------
-# === Mockup Example ===
-def run_demo(rank, world_size, backend='gloo'):
-    import numpy as np
-    import sys
-    np.set_printoptions(precision=2, threshold=sys.maxsize, linewidth=sys.maxsize)
 
-    dist.init_process_group(
-        backend=backend,
-        init_method='tcp://127.0.0.1:29500',
-        rank=rank,
-        world_size=world_size
-    )
+'''class MockHNClipLoss(ClipLoss):
+    def __init__(self, alpha=1.0, beta=0.25, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = alpha
+        self.beta = beta
 
-    if world_size > 1:
-        local_loss = True
-        gather_with_grad = True
-    else:
-        local_loss = False
-        gather_with_grad = False
+    def forward(
+        self,
+        image_features,
+        text_features,
+        global_image_features,
+        global_text_features,
+        logit_scale,
+        logit_bias=None,
+        output_dict=False,
+    ):
+        device = image_features.device
 
-    # Hyperparameters
-    batch_size = 4  # per-process
-    feature_dim = 32
-    m = 2  # multi-positive group size
+        logits_per_image = logit_scale * image_features @ global_text_features.T
+        logits_per_text = logit_scale * text_features @ global_image_features.T
+        n_anchors, n_global = logits_per_image.shape
+        labels = self.get_ground_truth(device, n_anchors)  # length n_anchors
+        print(f"LABELS at rank {self.rank} with shape {labels.shape}:\n{labels.cpu().numpy()}")
+        rows = torch.arange(n_anchors, device=device)
+        mask = torch.ones_like(logits_per_image, dtype=torch.bool)
+        mask[rows, labels] = False  # mask out the positive logits
 
-    # Generate random features (seeded differently per rank)
-    torch.manual_seed(42 + rank)
-    image_feats = torch.randn(batch_size*m, feature_dim, device=rank)
-    text_feats = torch.randn(batch_size, feature_dim, device=rank)
-    logit_scale = torch.tensor(1.0, device=rank)
+        # =====================
+        # Image-to-text loss
+        # =====================
+        exp_sim_i2t = torch.exp(logits_per_image)
+        print(f"Exp sim i2t at rank {self.rank} with shape {exp_sim_i2t.shape}:\n{exp_sim_i2t.cpu().numpy()}")
+        weights_i2t = torch.exp(self.beta * logits_per_image)
+        weights_i2t = weights_i2t * mask  # zero out the positive logits
 
-    # === Normalize Features ===
-    img = F.normalize(image_feats, dim=-1)
-    txt = F.normalize(text_feats, dim=-1)
+        weights_i2t = (n_anchors - 1) * weights_i2t / weights_i2t.sum(dim=1, keepdim=True)
+        print(f"Weights i2t at rank {self.rank} with shape {weights_i2t.shape}:\n{weights_i2t.cpu().numpy()}")
+        numerators = exp_sim_i2t[rows, labels]
+        print(f"Numerators i2t at rank {self.rank} with shape {numerators.shape}:\n{numerators.cpu().numpy()}")
+        denominators = self.alpha * numerators + (exp_sim_i2t * weights_i2t).sum(dim=1)
+        print(f"Denominators i2t at rank {self.rank} with shape {denominators.shape}:\n{denominators.cpu().numpy()}")
+        loss_i2t = -torch.log(numerators / denominators).mean()
 
-    # === MultiCLIPLoss ===
-    multiclip = MultiCLIPLoss(
-        m=m,
-        local_loss=local_loss,
-        gather_with_grad=gather_with_grad,
-        world_size=world_size,
-        rank=rank
-    )
-    multiclip_loss = multiclip(
-        image_features=img,
-        text_features=txt,
-        logit_scale=logit_scale.item()
-    )
-    print(f"[Rank {rank}] MultiCLIP Loss: {multiclip_loss.item():.4f}")
-
-    # === StableRepPlusLoss ===
-    stab_loss_fn = StableRepPlusLoss(
-        m=m,
-        local_loss=local_loss,
-        gather_with_grad=gather_with_grad,
-        world_size=world_size,
-        rank=rank
-    )
-    stable_loss_dict = stab_loss_fn(
-        image_features=img,
-        text_features=txt,
-        logit_scale=logit_scale.item(),
-        output_dict=True
-    )
-    print(f"[Rank {rank}] StableRepPlusLoss:")
-    for k, v in stable_loss_dict.items():
-        print(f"  {k}: {v.item():.4f}")
-
-    dist.destroy_process_group()
+        # =====================
+        # Text-to-image loss
+        # =====================
+        exp_sim_t2i = torch.exp(logits_per_text)
+        weights_t2i = torch.exp(self.beta * logits_per_text)
+        weights_t2i = weights_t2i * mask  # zero out the positive logits
+    
+        weights_t2i = (n_anchors - 1) * weights_t2i / weights_t2i.sum(dim=1, keepdim=True)
+        numerators = exp_sim_t2i[rows, labels]
+        denominators = self.alpha * numerators + (exp_sim_t2i * weights_t2i).sum(dim=1)
+        loss_t2i = -torch.log(numerators / denominators).mean()
+        
+        total_loss = (loss_i2t + loss_t2i) / 2
+        return {"hn_weighted_contrastive_loss": total_loss} if output_dict else total_loss
 
 if __name__ == "__main__":
-    import torch.multiprocessing as mp
+    torch.manual_seed(0)
+    n = 16  # total samples
+    d = 128
+    world_size = 4
+    logit_scale = torch.tensor(1.0)
 
-    world_size = 2
-    # spawn two processes (make sure your system supports GPUs or use cpu)
-    mp.spawn(
-        run_demo,
-        args=(world_size,),
-        nprocs=world_size,
-        join=True
-    )
+    img_feats = torch.randn(n, d)
+    txt_feats = torch.randn(n, d)
+
+    # simulate splitting across 4 gpus
+    local_bs = n // world_size
+    for rank in range(world_size):
+        loss_fn = MockHNClipLoss(local_loss=True, rank=rank, world_size=world_size)
+        print(f"\n=== Simulated GPU {rank} ===")
+        local_img = img_feats[rank * local_bs : (rank + 1) * local_bs]
+        local_txt = txt_feats[rank * local_bs : (rank + 1) * local_bs]
+
+        loss = loss_fn(local_img, local_txt, img_feats, txt_feats, logit_scale, output_dict=False)
+        print("loss:", loss.item())'''
