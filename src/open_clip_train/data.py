@@ -308,12 +308,21 @@ def get_dataset_size(shards):
     dir_path = os.path.dirname(shards_list[0])
     sizes_filename = os.path.join(dir_path, 'sizes.json')
     len_filename = os.path.join(dir_path, '__len__')
+    info_filename = os.path.join(dir_path, '_info.json')
     if os.path.exists(sizes_filename):
         sizes = json.load(open(sizes_filename, 'r'))
         total_size = sum([int(sizes[os.path.basename(shard)]) for shard in shards_list])
     elif os.path.exists(len_filename):
         # FIXME this used to be eval(open(...)) but that seemed rather unsafe
         total_size = ast.literal_eval(open(len_filename, 'r').read())
+    elif os.path.exists(info_filename):
+        info = json.load(open(info_filename, 'r'))
+        first_shard = os.path.basename(shards_list[0])
+        print(first_shard)
+        if 'train' in first_shard:
+            total_size = info['splits']['train']['num_samples']
+        elif 'val' in first_shard:
+            total_size = info['splits']['validation']['num_samples']
     else:
         total_size = None  # num samples undefined
         # some common dataset sizes (at time of authors last download)
@@ -424,7 +433,7 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
 def tarfile_to_samples_nothrow(src, handler=log_and_continue):
     # NOTE this is a re-impl of the webdataset impl with group_by_keys that doesn't throw
     streams = url_opener(src, handler=handler)
-    files = tar_file_expander(streams, handler=handler)
+    files = tar_file_expander(streams, handler=handler, eof_value=None)
     samples = group_by_keys_nothrow(files, handler=handler)
     return samples
 
