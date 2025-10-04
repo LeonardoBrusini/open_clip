@@ -39,10 +39,12 @@ class CsvDataset(Dataset):
 
         self.tokenize = tokenizer
         self.base_dir = base_folder
-        '''if is_train:
+        '''
+        if is_train:
             self.base_dir = os.path.join(base_folder, "images")
         else:
-            self.base_dir = os.path.join(base_folder, "val_images")'''
+            self.base_dir = os.path.join(base_folder, "val_images")
+        '''
 
     def __len__(self):
         return len(self.captions)
@@ -143,7 +145,7 @@ class MultiPositiveSampler(Sampler):
     Set m as an integer fraction of total_views for mixing multiple views across batch and across epochs.
     """
 
-    def __init__(self, dataset, m, batch_size, num_replicas=1, rank=0, shuffle=True, drop_last=True, seed=0):
+    def __init__(self, dataset, m, batch_size, num_replicas=1, rank=0, shuffle=True, drop_last=True, seed=0, epoch=0):
         #super().__init__(sampler=None, batch_size=batch_size, drop_last=drop_last)
         self.dataset = dataset
         self.m = m
@@ -155,7 +157,7 @@ class MultiPositiveSampler(Sampler):
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed
-        self.epoch = 0
+        self.epoch = epoch
 
         # Number of times each caption appears in an epoch
         self.repeats_per_caption = self.total_views // self.m
@@ -197,9 +199,6 @@ class MultiPositiveSampler(Sampler):
         self.epoch += 1
         return iter(batches)
 
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
 def multi_positive_collate_fn(batch, m, transforms, tokenizer):
     """
     Args:
@@ -221,6 +220,159 @@ def multi_positive_collate_fn(batch, m, transforms, tokenizer):
     texts = torch.stack(texts, dim=0)
     return images, texts
 
+class MPHNCsvDataset(Dataset):
+    def __init__(self, input_filename, transforms, img_key, caption_key, base_folder, subfolders, cap_subfolder, hn_subfolder, sep="\t", tokenizer=None):
+        df = pd.read_csv(input_filename, sep=sep)
+        """
+        dataframe: must have columns 
+            ["cap/rel_path", "hn/rel_path", "caption", "caption_mod"]
+        transform: optional transform for images
+        """
+        self.img_paths = df[img_key].tolist()
+        self.captions = df[caption_key].tolist()
+        self.hn_captions = df[f"hn_{caption_key}"].tolist()
+        self.transforms = transforms
+        self.img_key = img_key
+        self.caption_key = caption_key
+        self.base_folder = base_folder
+        self.subfolders = subfolders
+        self.cap_subfolder = cap_subfolder
+        self.hn_subfolder = hn_subfolder
+        self.tokenizer = tokenizer
+        self.total_views = len(subfolders)   # total variations available per caption
+
+    def __len__(self):
+        return len(self.img_paths)  # number of groups (3M)
+    
+    def get_all_views(self, idx, mode_subfolder):
+        """Return all possible image paths for this caption."""
+        rel_path = self.img_paths[idx]
+        img_paths = [os.path.join(self.base_folder, sub, mode_subfolder, rel_path) for sub in self.subfolders]
+        return img_paths
+
+    def __getitem__(self, idx):
+        if idx >= len(self.img_paths):
+            idx -= len(self.img_paths)
+            mode_subfolder = self.hn_subfolder
+            cap = self.hn_captions[idx]
+        else: 
+            mode_subfolder = self.cap_subfolder
+            cap = self.captions[idx]
+
+        img_paths = self.get_all_views(idx, mode_subfolder)
+        return img_paths, cap
+
+class HNSamplingScheduler:
+    def __init__(self, p_max=0.5, n_epochs=40, warmup_epochs=0):
+        self.p_max = p_max
+        self.n_epochs = n_epochs
+        self.warmup_epochs = warmup_epochs
+        self.mode = mode
+
+    def __call__(self, epoch):
+        if epoch < self.warmup_epochs:
+            return 0.0
+        progress = min(1.0, (epoch - self.warmup_epochs) / (self.n_epochs - self.warmup_epochs))
+        return progress * self.p_max
+
+class MPHNSampler(Sampler):
+    def __init__(self, dataset, batch_size, scheduler=None, num_replicas=1, rank=0, shuffle=True, drop_last=True, seed=0, epoch=0):
+        """
+        dataset: MPHNDataset
+        batch_size: int
+        scheduler: callable(epoch) -> p
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = epoch
+        self.scheduler = scheduler
+
+        logging.info(
+            f"Loaded {len(self.dataset)} unique samples with a caption and a hard-negative caption, each with {self.total_views} views. "
+            f"For a total dataset size of {2 * len(self.dataset) * self.total_views} images. "
+        )
+
+        if self.scheduler:
+            logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}, warmup_epochs={self.scheduler.warmup_epochs}.")
+        else:
+            logging.info("No scheduler provided, using fixed p=0.5.")
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        if self.scheduler: p = self.scheduler(self.epoch)
+        else: p = 0.5
+        logging.info(f"Epoch {self.epoch}: using p={p:.4f} for sampling.")
+        # 1. shuffle groups
+        group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
+        # 2. how many double+single batches
+        n_pools = int(len(self.dataset) / (self.batch_size * (1 - p)))
+        # 3. split into doubles vs singles
+        double_groups = group_indices[:n_pools]
+        single_groups = group_indices[n_pools:]
+
+        batches = []
+        leftovers = []
+        d_ptr, s_ptr = 0, 0
+        num_doubles_per_batch = int(p * self.batch_size) #OK
+        num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch #OK
+
+        # 4. build mixed batches
+        for _ in range(n_pools):
+            batch = []
+            # doubles
+            for _ in range(num_doubles_per_batch):
+                gid = double_groups[d_ptr]
+                batch.append(gid)
+                batch.append(gid+len(self.dataset)) # hn version
+                d_ptr += 1
+            # singles (draw alternating from base/mod)
+            for _ in range(num_singles_per_batch):
+                gid = single_groups[s_ptr]
+                if random.random() < 0.5:
+                    batch.append(gid)
+                    leftovers.append(gid+len(self.dataset))
+                else:
+                    batch.append(gid+len(self.dataset))
+                    leftovers.append(gid)
+            batches.append(batch)
+
+        # 5. pure singles batches from leftovers
+        random.shuffle(leftovers)
+        for i in range(0, len(leftovers), self.batch_size):
+            batch = leftovers[i:i+self.batch_size]
+            if len(batch) == self.batch_size:
+                batches.append(batch)
+        # 6. shuffle batches order
+        if self.shuffle: random.shuffle(batches)
+        self.epoch += 1
+        return iter(batches)
+
+    def __len__(self): # Number of batches per epoch
+        return (2 * len(self.dataset)) // self.batch_size
+
+def mphn_collate_fn(batch, transforms, tokenizer):
+    """
+    Args:
+        batch: List of (list_of_all_image_paths, caption)
+    Returns:
+        images: (n*len(subfolders), C, H, W)
+        texts: (n, seq_len)
+    """
+    images = []
+    texts = []
+
+    for all_paths, caption in batch:
+        images.extend([transforms(Image.open(p)) for p in all_paths])
+        texts.append(tokenizer([str(caption)])[0])
+
+    images = torch.stack(images, dim=0)
+    texts = torch.stack(texts, dim=0)
+    return images, texts
 
 class DistillationCsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
@@ -754,7 +906,8 @@ def get_multi_positive_csv_dataset(args, preprocess_fn, is_train, epoch=0, token
         rank=torch.distributed.get_rank(),
         shuffle=is_train,
         drop_last=is_train,
-        seed=args.seed
+        seed=args.seed,
+        epoch=epoch
     ) if is_train else None
     
     dataloader = DataLoader(
@@ -767,6 +920,45 @@ def get_multi_positive_csv_dataset(args, preprocess_fn, is_train, epoch=0, token
 
     dataloader.num_samples = len(dataset) * (len(subfolders) // args.views_per_caption)  # actual #samples per epoch
     dataloader.num_batches = len(dataloader)
+    return DataInfo(dataloader, sampler)
+
+def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+    assert is_train, "Multi-Positive dataset is only supported for training. The validation should be done with a regular CSV dataset."
+
+    dataset = MPHNCsvDataset(
+        input_filename=args.train_data,
+        transforms=preprocess_fn,
+        img_key=args.csv_img_key,
+        caption_key=args.csv_caption_key,
+        base_folder=args.base_folder,
+        subfolders=args.image_subfolders,
+        cap_subfolder=args.cap_subfolder,
+        hn_subfolder=args.hn_subfolder,
+        sep=args.csv_separator,
+        tokenizer=tokenizer
+    )
+    
+    sampler = MPHNSampler(
+        dataset,
+        batch_size=args.batch_size,
+        num_replicas=torch.distributed.get_world_size(),
+        rank=torch.distributed.get_rank(),
+        shuffle=is_train,
+        drop_last=is_train,
+        seed=args.seed,
+        epoch=epoch
+    ) if is_train else None
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=lambda b: mphn_collate_fn(b, transforms=dataset.transforms, tokenizer=dataset.tokenize),
+        num_workers=args.workers,
+        pin_memory=True
+    )
+
+    dataloader.num_samples = len(dataset) * 2
+    dataloader.num_batches = len(sampler)
     return DataInfo(dataloader, sampler)
 
 def get_distilled_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
@@ -868,6 +1060,10 @@ def get_dataset_fn(data_path, dataset_type):
         if "val" in data_path:
             return get_csv_dataset
         return get_multi_positive_csv_dataset
+    elif dataset_type == "mphn-csv":
+        if "val" in data_path:
+            return get_csv_dataset
+        return get_mphn_csv_dataset
     elif dataset_type == "auto":
         ext = data_path.split('.')[-1]
         if ext in ['csv', 'tsv']:
