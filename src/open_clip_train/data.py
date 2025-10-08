@@ -33,7 +33,9 @@ class CsvDataset(Dataset):
         df = pd.read_csv(input_filename, sep=sep)
 
         self.images = df[img_key].tolist()
+        #logging.info(f'First 10 image paths: {self.images[:10]}')
         self.captions = df[caption_key].tolist()
+        #logging.info(f'First 10 captions: {self.captions[:10]}')
         self.transforms = transforms
         logging.debug('Done loading data.')
 
@@ -51,6 +53,7 @@ class CsvDataset(Dataset):
 
     def __getitem__(self, idx):
         #images = self.transforms(Image.open(str(self.images[idx])))
+        #logging.info(f'Index {idx}: loading image from {self.base_dir}, {str(self.images[idx])}')
         images = self.transforms(Image.open(os.path.join(self.base_dir, str(self.images[idx]))))
         texts = self.tokenize([str(self.captions[idx])])[0]
         return images, texts
@@ -300,7 +303,9 @@ class MPHNSampler(Sampler):
         logging.info(f"Epoch {self.epoch}: using p={p:.4f} for sampling.")
 
         group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
-        n_pools = int(len(self.dataset) / (self.batch_size * (1 - p)))
+        group_indices = group_indices[self.rank::self.num_replicas] # slice for this rank
+
+        n_pools = int(len(group_indices) / (self.batch_size * (1 - p)))
         double_groups = group_indices[:n_pools]
         single_groups = group_indices[n_pools:]
 
@@ -330,20 +335,25 @@ class MPHNSampler(Sampler):
                 batch.append(gid+len(self.dataset))
                 d_ptr += 1
             batches.append(batch)
-
+        
         # 5. pure singles batches from leftovers
         random.shuffle(leftovers)
         for i in range(0, len(leftovers), self.batch_size):
             batch = leftovers[i:i+self.batch_size]
-            if len(batch) == self.batch_size:
-                batches.append(batch)
+            if self.drop_last and len(batch) < self.batch_size:
+                continue
+            batches.append(batch)
         # 6. shuffle batches order
         if self.shuffle: random.shuffle(batches)
         self.epoch += 1
         return iter(batches)
 
     def __len__(self): # Number of batches per epoch
-        return (2 * len(self.dataset)) // self.batch_size
+        total_rank = math.ceil((2 * len(self.dataset)) / self.num_replicas)
+        if self.drop_last:
+            return total_rank // self.batch_size
+        else:
+            return math.ceil(total_rank / self.batch_size)
 
 def mphn_collate_fn(batch, transforms, tokenizer):
     """
