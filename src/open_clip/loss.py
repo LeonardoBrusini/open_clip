@@ -502,7 +502,7 @@ class TripletCLIPLoss(nn.Module):
         return loss#, accuracy
     
     def tripletclip_loss(self, img_embs, text_embs, neg_img_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_img_embs, all_neg_text_embs, logit_scale):
-        # cross-type image negatives (base<-->hn) is NOT used in TripletCLIP, that's why i think it is not as good ad the usual clip loss
+        # cross-type image negatives (base<-->hn) is NOT used in TripletCLIP, that's why i think it is not as good ad the usual clip loss (in optimal conditions)
         #loss_1, accuracy1 = self.negclip_loss(img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
         #loss_2, accuracy2 = self.negclip_loss(neg_img_embs, neg_text_embs, text_embs, all_neg_img_embs, all_neg_text_embs, all_text_embs, logit_scale)
         loss_1 = self.negclip_loss(img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
@@ -546,6 +546,265 @@ class TripletCLIPLoss(nn.Module):
         if output_dict:
             return {"tripletclip_loss": loss}
         return loss
+
+class MultiTripletClipLoss(TripletCLIPLoss):
+    """
+    Multi-positive TripletCLIP loss: each caption has m positive images.
+    Extends TripletCLIPLoss by adapting label construction and similarity matrices.
+    """
+
+    def __init__(
+        self,
+        m: int,
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
+        use_horovod=False,
+    ):
+        super().__init__(
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod,
+        )
+        self.m = m
+
+    def get_ground_truth(self, device: torch.device, num_texts: int):
+        """
+        Returns soft labels for text→image and one-hot for image→text.
+
+        num_texts = number of text samples in current rank.
+        """
+        if self.prev_num_logits != num_texts or device not in self.labels:
+            n = num_texts
+            m = self.m
+            ws = self.world_size
+            r = self.rank
+
+            # Local indices
+            cap_idx = torch.arange(n, device=device) + r * n              # [n]
+            all_cap_idx = concat_all_gather(cap_idx)                      # [n*world_size]
+
+            num_img = n * m
+            img_idx = torch.arange(num_img, device=device) + r * num_img  # [n*m]
+            all_img_idx = concat_all_gather(img_idx)                      # [n*m*world_size]
+
+            # Text→Image soft labels
+            img_group = all_img_idx // m
+            mask_t2i = cap_idx.unsqueeze(1) == img_group.unsqueeze(0)     # [n, n*m*world_size]
+            labels_t2i = mask_t2i.float().div(mask_t2i.sum(1, keepdim=True).clamp(min=1.0))
+
+            # Image→Text one-hot labels
+            img_to_cap = img_idx // m
+            mask_i2t = img_to_cap.unsqueeze(1) == all_cap_idx.unsqueeze(0)  # [n*m, n*world_size]
+            labels_i2t = mask_i2t.float()
+
+            if self.cache_labels:
+                self.labels[device] = (labels_t2i, labels_i2t)
+                self.prev_num_logits = num_texts
+            else:
+                return (labels_t2i, labels_i2t)
+
+        return self.labels[device]
+
+    def negclip_loss(self, img_embs, text_embs, neg_text_embs,
+                           all_img_embs, all_text_embs, all_neg_text_embs, logit_scale):
+        """
+        Multi-positive version of negclip_loss.
+        Each caption has m positive images (soft labels).
+        """
+        n = text_embs.shape[0]  # number of captions
+        gt_t2i, gt_i2t = self.get_ground_truth(img_embs.device, n)
+
+        # Similarity matrices
+        img_text_sim = logit_scale * img_embs @ all_text_embs.T
+        text_img_sim = logit_scale * text_embs @ all_img_embs.T
+        img_negtext_sim = logit_scale * img_embs @ all_neg_text_embs.T
+
+        # Combine positives + negatives for image→text
+        combined_i2t = torch.cat([img_text_sim, img_negtext_sim], dim=-1)
+
+        # Compute losses
+        loss_i2t = compute_cross_entropy(gt_i2t, combined_i2t)
+        loss_t2i = compute_cross_entropy(gt_t2i, text_img_sim)
+        return (loss_i2t + loss_t2i) / 2
+
+    def tripletclip_loss(self, img_embs, text_embs, neg_img_embs, neg_text_embs,
+                          all_img_embs, all_text_embs, all_neg_img_embs, all_neg_text_embs, logit_scale):
+        """
+        Multi-positive TripletCLIP loss, symmetric over base and negative pairs.
+        """
+        loss_1 = self.negclip_loss(img_embs, text_embs, neg_text_embs,
+                                    all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
+        loss_2 = self.negclip_loss(neg_img_embs, neg_text_embs, text_embs,
+                                    all_neg_img_embs, all_neg_text_embs, all_text_embs, logit_scale)
+        return loss_1 + loss_2
+
+    def forward(
+            self,
+            image_features: torch.Tensor,
+            text_features: torch.Tensor,
+            logit_scale: torch.Tensor,
+            logit_bias: torch.Tensor = None,
+            output_dict: bool = False
+    ):
+        if self.world_size > 1:
+            all_image_features, all_text_features = gather_features(
+                image_features, text_features,
+                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod
+            )
+        else:
+            all_image_features, all_text_features = image_features, text_features
+        n_pairs = text_features.shape[0] // 2
+        all_n_pairs = all_text_features.shape[0] // 2
+        m = self.m
+        # Split into positive and hard-negative samples
+        text_embs, neg_text_embs = text_features[0::2], text_features[1::2]
+        all_text_embs, all_neg_text_embs = all_text_features[0::2], all_text_features[1::2]
+
+        # original shape: (n_pairs*2*m, dim)
+        img_blocks = image_features.view(n_pairs, 2*m, -1)
+        all_img_blocks = all_image_features.view(all_n_pairs, 2*m, -1)
+
+        img_embs = img_blocks[:, :m, :].reshape(-1, img_blocks.size(-1))    # (n_pairs*m, dim)
+        neg_img_embs = img_blocks[:, m:, :].reshape(-1, img_blocks.size(-1))  # (n_pairs*m, dim)
+        all_img_embs = all_img_blocks[:, :m, :].reshape(-1, all_img_blocks.size(-1))  # (all_n_pairs*m, dim)    
+        all_neg_img_embs = all_img_blocks[:, m:, :].reshape(-1, all_img_blocks.size(-1))  # (all_n_pairs*m, dim)
+
+        loss = self.tripletclip_loss(
+            img_embs, text_embs,
+            neg_img_embs, neg_text_embs,
+            all_img_embs, all_text_embs,
+            all_neg_img_embs, all_neg_text_embs,
+            logit_scale
+        )
+
+        if output_dict:
+            return {"multi_tripletclip_loss": loss}
+        return loss
+
+class TripletStableRepLoss(MultiTripletClipLoss):
+    def __init__(
+        self,
+        m: int = 4,
+        local_loss=False,
+        gather_with_grad=False,
+        cache_labels=False,
+        rank=0,
+        world_size=1,
+        use_horovod=False,
+    ):
+        super().__init__(
+            m=m,
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod
+        )
+        self.stablerep_prev_num_logits = 0
+        self.stablerep_labels = {}
+
+    def get_stablerep_logits(self, image_features, logit_scale=10, logit_bias=None):
+        if self.world_size > 1:
+            all_image_features, _ = gather_features(
+                image_features,
+                local_loss=self.local_loss,
+                gather_with_grad=self.gather_with_grad,
+                rank=self.rank,
+                world_size=self.world_size,
+                use_horovod=self.use_horovod,
+            )
+
+            # StableRep originally uses a FIXED temperature of 0.1 and devides the logits, which is equivalent to multiplying by 10
+            # Thus here we use a logit_scale of 10 to match the original StableRep implementation
+
+            if self.local_loss:
+                logits = logit_scale * image_features @ all_image_features.T
+            else:
+                logits = logit_scale * all_image_features @ all_image_features.T
+        else:
+            logits = logit_scale * image_features @ image_features.T
+
+        if logit_bias is not None:
+            logits += logit_bias
+
+        return logits
+
+    def get_stablerep_ground_truth(self, device: torch.device, num_logits: int) -> torch.Tensor:
+        if self.stablerep_prev_num_logits != num_logits or device not in self.stablerep_labels:
+            local_idx = torch.arange(num_logits, device=device)
+            if self.local_loss and self.world_size > 1:
+                local_idx += self.rank * num_logits
+            all_idx = concat_all_gather(local_idx)
+            group_local = local_idx // self.m
+            group_all = all_idx // self.m
+            mask = group_local.unsqueeze(1) == group_all.unsqueeze(0)
+            # self-mask is used to exclude self-comparisons
+            if self.local_loss:
+                # self-mask is used to exclude self-comparisons in the global matrix
+                logits_range = torch.arange(num_logits, device=device)
+                global_idx = self.rank * num_logits + logits_range
+                mask[logits_range, global_idx] = False
+            else:
+                mask.fill_diagonal_(0)
+            labels = mask.float().div(mask.sum(1, keepdim=True).clamp(min=1.0))
+            if self.cache_labels:
+                self.stablerep_labels[device] = labels
+                self.stablerep_prev_num_logits = num_logits
+            return labels
+        else:
+            return self.stablerep_labels[device]
+
+    def forward(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor,
+        logit_scale: torch.Tensor,
+        logit_bias: torch.Tensor = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        output_dict: bool = False
+    ):
+        multitripletclip_loss = super().forward(
+            image_features=image_features,
+            text_features=text_features,
+            logit_scale=logit_scale,
+            logit_bias=logit_bias,
+            output_dict=False
+        )
+
+        logits = self.get_stablerep_logits(
+            image_features=image_embeddings,
+            logit_bias=logit_bias
+        ) 
+
+        dtype = logits.dtype
+        min_val = -torch.finfo(dtype).max  # most negative representable value
+        safe_val = min_val / 10   # avoid edge-of-range numerical instability
+
+        if self.local_loss:
+            # Explicitly mask out each local sample's self‐comparison in the global matrix
+            B = logits.size(0)
+            b_arange = torch.arange(B, device=image_features.device)
+            global_idx = self.rank * B + b_arange
+            logits[b_arange, global_idx] = safe_val
+        else:
+            logits.fill_diagonal_(safe_val)  # Avoid self-comparisons in StableRep
+        gt = self.get_stablerep_ground_truth(image_features.device, logits.shape[0])
+        #print(f"StableRep ground truth p at rank {self.rank}:\n{gt.cpu().numpy()}")
+        stablerep_loss = compute_cross_entropy(gt, logits)
+
+        if output_dict:
+            return {
+                "mp_tripletclip_loss": multitripletclip_loss,
+                "stable_rep_loss": stablerep_loss
+            }
+        return multitripletclip_loss, stablerep_loss
 
 class CoCaLoss(ClipLoss):
     def __init__(

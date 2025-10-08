@@ -546,6 +546,12 @@ def parse_args(args):
         action="store_true",
         help="Use HNClip loss for training. Only in combination with csv or hn-csv dataset."
     )
+    parser.add_argument(
+        "--hn-scheduler",
+        default=False,
+        action="store_true",
+        help="Use a scheduler for hard negative sampling percentage. Only in combination with mphn-csv dataset."
+    )
     
     
     args = parser.parse_args(args)

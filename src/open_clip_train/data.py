@@ -223,11 +223,6 @@ def multi_positive_collate_fn(batch, m, transforms, tokenizer):
 class MPHNCsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, base_folder, subfolders, cap_subfolder, hn_subfolder, sep="\t", tokenizer=None):
         df = pd.read_csv(input_filename, sep=sep)
-        """
-        dataframe: must have columns 
-            ["cap/rel_path", "hn/rel_path", "caption", "caption_mod"]
-        transform: optional transform for images
-        """
         self.img_paths = df[img_key].tolist()
         self.captions = df[caption_key].tolist()
         self.hn_captions = df[f"hn_{caption_key}"].tolist()
@@ -242,7 +237,7 @@ class MPHNCsvDataset(Dataset):
         self.total_views = len(subfolders)   # total variations available per caption
 
     def __len__(self):
-        return len(self.img_paths)  # number of groups (3M)
+        return len(self.img_paths)
     
     def get_all_views(self, idx, mode_subfolder):
         """Return all possible image paths for this caption."""
@@ -263,16 +258,12 @@ class MPHNCsvDataset(Dataset):
         return img_paths, cap
 
 class HNSamplingScheduler:
-    def __init__(self, p_max=0.5, n_epochs=40, warmup_epochs=0):
+    def __init__(self, p_max=0.5, n_epochs=40):
         self.p_max = p_max
         self.n_epochs = n_epochs
-        self.warmup_epochs = warmup_epochs
-        self.mode = mode
 
     def __call__(self, epoch):
-        if epoch < self.warmup_epochs:
-            return 0.0
-        progress = min(1.0, (epoch - self.warmup_epochs) / (self.n_epochs - self.warmup_epochs))
+        progress = min(1.0, epoch / self.n_epochs)
         return progress * self.p_max
 
 class MPHNSampler(Sampler):
@@ -307,29 +298,21 @@ class MPHNSampler(Sampler):
         if self.scheduler: p = self.scheduler(self.epoch)
         else: p = 0.5
         logging.info(f"Epoch {self.epoch}: using p={p:.4f} for sampling.")
-        # 1. shuffle groups
+
         group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
-        # 2. how many double+single batches
         n_pools = int(len(self.dataset) / (self.batch_size * (1 - p)))
-        # 3. split into doubles vs singles
         double_groups = group_indices[:n_pools]
         single_groups = group_indices[n_pools:]
 
         batches = []
         leftovers = []
         d_ptr, s_ptr = 0, 0
-        num_doubles_per_batch = int(p * self.batch_size) #OK
-        num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch #OK
+        num_doubles_per_batch = int(p * self.batch_size)
+        num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch 
 
         # 4. build mixed batches
         for _ in range(n_pools):
             batch = []
-            # doubles
-            for _ in range(num_doubles_per_batch):
-                gid = double_groups[d_ptr]
-                batch.append(gid)
-                batch.append(gid+len(self.dataset)) # hn version
-                d_ptr += 1
             # singles (draw alternating from base/mod)
             for _ in range(num_singles_per_batch):
                 gid = single_groups[s_ptr]
@@ -339,6 +322,13 @@ class MPHNSampler(Sampler):
                 else:
                     batch.append(gid+len(self.dataset))
                     leftovers.append(gid)
+                s_ptr += 1
+            # doubles
+            for _ in range(num_doubles_per_batch):
+                gid = double_groups[d_ptr]
+                batch.append(gid)
+                batch.append(gid+len(self.dataset))
+                d_ptr += 1
             batches.append(batch)
 
         # 5. pure singles batches from leftovers
@@ -924,6 +914,7 @@ def get_multi_positive_csv_dataset(args, preprocess_fn, is_train, epoch=0, token
 
 def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     assert is_train, "Multi-Positive dataset is only supported for training. The validation should be done with a regular CSV dataset."
+    assert not (args.hn_scheduler and args.tripletclip), "HNScheduler and TripletCLIP cannot be used together."
 
     dataset = MPHNCsvDataset(
         input_filename=args.train_data,
@@ -937,10 +928,10 @@ def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None)
         sep=args.csv_separator,
         tokenizer=tokenizer
     )
-    
     sampler = MPHNSampler(
         dataset,
         batch_size=args.batch_size,
+        scheduler=HNSamplingScheduler(n_epochs=args.epochs) if args.hn_scheduler else None,
         num_replicas=torch.distributed.get_world_size(),
         rank=torch.distributed.get_rank(),
         shuffle=is_train,
