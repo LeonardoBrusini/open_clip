@@ -618,7 +618,8 @@ class MultiTripletClipLoss(TripletCLIPLoss):
         Each caption has m positive images (soft labels).
         """
         n = text_embs.shape[0]  # number of captions
-        gt_t2i, gt_i2t = self.get_ground_truth(img_embs.device, n)
+        device = text_embs.device
+        gt_t2i, gt_i2t = self.get_ground_truth(device, n)
 
         # Similarity matrices
         img_text_sim = logit_scale * img_embs @ all_text_embs.T
@@ -627,9 +628,10 @@ class MultiTripletClipLoss(TripletCLIPLoss):
 
         # Combine positives + negatives for image→text
         combined_i2t = torch.cat([img_text_sim, img_negtext_sim], dim=-1)
+        combined_gt_i2t = torch.cat([gt_i2t, torch.zeros((img_text_sim.shape[0], all_neg_text_embs.shape[0]), device=device)], dim=-1)
 
         # Compute losses
-        loss_i2t = compute_cross_entropy(gt_i2t, combined_i2t)
+        loss_i2t = compute_cross_entropy(combined_gt_i2t, combined_i2t)
         loss_t2i = compute_cross_entropy(gt_t2i, text_img_sim)
         return (loss_i2t + loss_t2i) / 2
 
@@ -650,8 +652,10 @@ class MultiTripletClipLoss(TripletCLIPLoss):
             text_features: torch.Tensor,
             logit_scale: torch.Tensor,
             logit_bias: torch.Tensor = None,
+            num_doubles: int = 0,
             output_dict: bool = False
     ):
+        # ---- 1. Gather across ranks if distributed ----
         if self.world_size > 1:
             all_image_features, all_text_features = gather_features(
                 image_features, text_features,
@@ -659,30 +663,61 @@ class MultiTripletClipLoss(TripletCLIPLoss):
             )
         else:
             all_image_features, all_text_features = image_features, text_features
-        n_pairs = text_features.shape[0] // 2
-        all_n_pairs = all_text_features.shape[0] // 2
-        m = self.m
-        # Split into positive and hard-negative samples
-        text_embs, neg_text_embs = text_features[0::2], text_features[1::2]
-        all_text_embs, all_neg_text_embs = all_text_features[0::2], all_text_features[1::2]
 
-        # original shape: (n_pairs*2*m, dim)
-        img_blocks = image_features.view(n_pairs, 2*m, -1)
-        all_img_blocks = all_image_features.view(all_n_pairs, 2*m, -1)
+        device = image_features.device
+        m = self.m  # number of positive image views per caption
+        local_n = text_features.shape[0]   # total text embeddings (pos + neg) in this rank
+        dim = text_features.shape[-1]
+        world_size = self.world_size
 
-        img_embs = img_blocks[:, :m, :].reshape(-1, img_blocks.size(-1))    # (n_pairs*m, dim)
-        neg_img_embs = img_blocks[:, m:, :].reshape(-1, img_blocks.size(-1))  # (n_pairs*m, dim)
-        all_img_embs = all_img_blocks[:, :m, :].reshape(-1, all_img_blocks.size(-1))  # (all_n_pairs*m, dim)    
-        all_neg_img_embs = all_img_blocks[:, m:, :].reshape(-1, all_img_blocks.size(-1))  # (all_n_pairs*m, dim)
+        if num_doubles > 0:
+            # ---- 2. Split local text embeddings ----
+            neg_text_embs = text_features[:num_doubles]
+            text_embs = text_features[num_doubles:]
 
-        loss = self.tripletclip_loss(
-            img_embs, text_embs,
-            neg_img_embs, neg_text_embs,
-            all_img_embs, all_text_embs,
-            all_neg_img_embs, all_neg_text_embs,
-            logit_scale
-        )
+            # ---- 3. Split global text embeddings per rank ----
+            all_text_reshaped = all_text_features.view(world_size, local_n, dim)
+            all_neg_text_embs = all_text_reshaped[:, :num_doubles, :].reshape(-1, dim)
+            all_text_embs = all_text_reshaped[:, num_doubles:, :].reshape(-1, dim)
 
+            # ---- 4. Handle image embeddings ----
+            # Each caption (pos or neg) has m image embeddings, so local total = local_n * m
+            local_img_total = image_features.shape[0]
+            dim_img = image_features.shape[-1]
+            local_img_blocks = image_features.view(local_n, m, dim_img)
+            all_img_blocks = all_image_features.view(world_size, local_n, m, dim_img)
+
+            # First num_doubles are the ones with hard negatives (neg_img_embs)
+            neg_img_embs = local_img_blocks[:num_doubles].reshape(-1, dim_img)
+            img_embs = local_img_blocks[num_doubles:].reshape(-1, dim_img)
+
+            # Global version
+            all_neg_img_embs = all_img_blocks[:, :num_doubles, :, :].reshape(-1, dim_img)
+            all_img_embs = all_img_blocks[:, num_doubles:, :, :].reshape(-1, dim_img)
+
+            # ---- 5. Compute the loss ----
+            loss = self.tripletclip_loss(
+                img_embs, text_embs,
+                neg_img_embs, neg_text_embs,
+                all_img_embs, all_text_embs,
+                all_neg_img_embs, all_neg_text_embs,
+                logit_scale
+            )
+        # ---- CASE 2: no hard negatives ----
+        else:
+            n = text_features.shape[0]
+            gt_t2i, gt_i2t = self.get_ground_truth(device, n)
+
+            # Similarity matrices
+            img_text_sim = logit_scale * image_features @ all_text_features.T
+            text_img_sim = logit_scale * text_features @ all_image_features.T
+
+            # Pure multi-positive CLIP loss (no negatives)
+            loss_i2t = compute_cross_entropy(gt_i2t, img_text_sim)
+            loss_t2i = compute_cross_entropy(gt_t2i, text_img_sim)
+            loss = (loss_i2t + loss_t2i) / 2
+
+        # ---- 6. Optional dict output ----
         if output_dict:
             return {"multi_tripletclip_loss": loss}
         return loss
@@ -768,6 +803,7 @@ class TripletStableRepLoss(MultiTripletClipLoss):
         logit_scale: torch.Tensor,
         logit_bias: torch.Tensor = None,
         image_embeddings: Optional[torch.Tensor] = None,
+        num_doubles: int = 0,
         output_dict: bool = False
     ):
         multitripletclip_loss = super().forward(
@@ -775,6 +811,7 @@ class TripletStableRepLoss(MultiTripletClipLoss):
             text_features=text_features,
             logit_scale=logit_scale,
             logit_bias=logit_bias,
+            num_doubles=num_doubles,
             output_dict=False
         )
 

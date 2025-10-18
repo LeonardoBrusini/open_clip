@@ -93,8 +93,9 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             images, texts, dist_image_features, dist_text_features = batch
             dist_image_features = dist_image_features.to(device=device, dtype=input_dtype, non_blocking=True)
             dist_text_features = dist_text_features.to(device=device, dtype=input_dtype, non_blocking=True)
-        else:
-            images, texts = batch
+        elif args.dataset_type=="mphn-csv": images, texts, num_doubles = batch
+        else: images, texts = batch
+
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
 
@@ -113,7 +114,9 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     model_out["dist_image_features"] = dist_image_features
                     model_out["dist_text_features"] = dist_text_features
                     model_out["dist_logit_scale"] = 100.0
-                losses = loss(**model_out, output_dict=True)
+                
+                if args.tripletclip and args.dataset_type=="mphn-csv": losses=loss(**model_out, num_doubles=num_doubles, output_dict=True)
+                else: losses = loss(**model_out, output_dict=True)
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
