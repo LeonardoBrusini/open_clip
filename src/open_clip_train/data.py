@@ -349,13 +349,13 @@ class MPHNBatchedSampler(Sampler):
             yield b
 
     def __len__(self):
-        return (2 * len(self.dataset)) // self.batch_size
+        return (2 * len(self.dataset)) // self.batch_size #OK
 
 
 # =========================
 # Adapter: executes dataset indexing in workers
 # =========================
-class MPHNBatchedSamplerAdapter:
+class MPHNBatchedSamplerAdapter(IterableDataset):
     """Feeds (indices, num_doubles) from batch sampler into DataLoader workers."""
     def __init__(self, dataset, batch_sampler):
         self.dataset = dataset
@@ -439,7 +439,7 @@ class DataInfo:
     def set_epoch(self, epoch):
         if self.shared_epoch is not None:
             self.shared_epoch.set_value(epoch)
-        if self.sampler is not None and isinstance(self.sampler, DistributedSampler):
+        if self.sampler is not None:# and isinstance(self.sampler, DistributedSampler):
             self.sampler.set_epoch(epoch)
 
 
@@ -972,8 +972,8 @@ def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None)
     )
 
     dataloader.num_samples = len(dataset) * 2
-    dataloader.num_batches = len(sampler)
-    return DataInfo(dataloader, sampler)
+    dataloader.num_batches = len(batch_sampler)
+    return DataInfo(dataloader, batch_sampler)
 
 def get_distilled_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data

@@ -525,8 +525,8 @@ class TripletCLIPLoss(nn.Module):
         self.labels = {}
 
         # whether to use the hard negative margin loss
-        self.hn_margin_loss = margin_loss # Assumes batch is organized as (base, hn, base, hn, ...)
-        self.hn_pos = None
+        #self.hn_margin_loss = margin_loss # Assumes batch is organized as (base, hn, base, hn, ...)
+        #self.hn_pos = None
 
     def get_ground_truth(self, device, num_logits) -> torch.Tensor:
         # calculated ground-truth and cache if enabled
