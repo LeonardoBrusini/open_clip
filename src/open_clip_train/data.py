@@ -312,11 +312,11 @@ class MPHNBatchedSampler(Sampler):
         group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
         group_indices = group_indices[self.rank:len(group_indices):self.num_replicas]
 
-        n_pools = int(len(group_indices) / (self.batch_size * (1 - p)))
         batches, leftovers = [], []
         g_ptr = 0
         num_doubles_per_batch = int(p * self.batch_size)
         num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch
+        n_pools = len(group_indices) // (num_doubles_per_batch + num_singles_per_batch)
 
         for _ in range(n_pools):
             batch, base = [], []
