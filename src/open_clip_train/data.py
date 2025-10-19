@@ -349,7 +349,13 @@ class MPHNBatchedSampler(Sampler):
             yield b
 
     def __len__(self):
-        return (2 * len(self.dataset)) // self.batch_size #OK
+        # total items are 2 * len(self.dataset) (caption + hn)
+        # divide by num_replicas to get items per replica
+        # divide by batch_size to get batches per replica
+        if self.drop_last:
+            return (2 * len(self.dataset) // self.num_replicas) // self.batch_size
+        else:
+            return math.ceil((2 * len(self.dataset) / self.num_replicas) / self.batch_size)
 
 
 # =========================
@@ -362,7 +368,21 @@ class MPHNBatchedSamplerAdapter(IterableDataset):
         self.batch_sampler = batch_sampler
 
     def __iter__(self):
-        for batch_indices, num_doubles in self.batch_sampler:
+        worker_info = get_worker_info()
+        if worker_info is None:
+            # single-process data loading
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        # get all batches for the current replica from the underlying sampler
+        batches_for_replica = list(self.batch_sampler)
+
+        # split the batches among the workers
+        for batch_info in batches_for_replica[worker_id::num_workers]:
+            batch_indices, num_doubles = batch_info
             batch = [self.dataset[i] for i in batch_indices]
             yield (batch, num_doubles)
 
@@ -971,7 +991,8 @@ def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None)
         pin_memory=True
     )
 
-    dataloader.num_samples = len(dataset) * 2
+    # num_samples is the number of images processed per epoch on a single replica
+    dataloader.num_samples = (len(dataset) * dataset.total_views * 2) // torch.distributed.get_world_size()
     dataloader.num_batches = len(batch_sampler)
     return DataInfo(dataloader, batch_sampler)
 
