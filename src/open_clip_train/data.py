@@ -306,6 +306,7 @@ class MPHNBatchedSampler(Sampler):
 
     def __iter__(self):
         g = torch.Generator().manual_seed(self.seed + self.epoch)
+        rng = random.Random(self.seed + self.epoch)
         p = self.scheduler(self.epoch) if self.scheduler else 0.5
         logging.info(f"Epoch {self.epoch}: using p={p:.4f}")
 
@@ -336,8 +337,6 @@ class MPHNBatchedSampler(Sampler):
                     leftovers.append(gid)
                 g_ptr += 1
             batches.append((batch, num_doubles_per_batch))
-
-        rng = random.Random(self.seed + self.epoch)
 
         rng.shuffle(leftovers)
         for i in range(0, len(leftovers), self.batch_size):
