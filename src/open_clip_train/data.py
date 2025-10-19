@@ -284,12 +284,12 @@ class MPHNSampler(Sampler):
         self.scheduler = scheduler
 
         logging.info(
-            f"Loaded {len(self.dataset)} unique samples with a caption and a hard-negative caption, each with {self.total_views} views. "
-            f"For a total dataset size of {2 * len(self.dataset) * self.total_views} images. "
+            f"Loaded {len(self.dataset)} unique samples with a caption and a hard-negative caption, each with {self.dataset.total_views} views. "
+            f"For a total dataset size of {2 * len(self.dataset) * self.dataset.total_views} images. "
         )
 
         if self.scheduler:
-            logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}, warmup_epochs={self.scheduler.warmup_epochs}.")
+            logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}.")
         else:
             logging.info("No scheduler provided, using fixed p=0.5.")
 
@@ -303,14 +303,12 @@ class MPHNSampler(Sampler):
         logging.info(f"Epoch {self.epoch}: using p={p:.4f} for sampling.")
 
         group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
-        group_indices = group_indices[self.rank::self.num_replicas]
-        n_pools = int(len(self.dataset) / (self.batch_size * (1 - p)))
-        double_groups = group_indices[:n_pools]
-        single_groups = group_indices[n_pools:]
+        group_indices = group_indices[self.rank:len(group_indices):self.num_replicas]
+        n_pools = int(len(group_indices) / (self.batch_size * (1 - p)))
 
         batches = []
         leftovers = []
-        d_ptr, s_ptr = 0, 0
+        g_ptr = 0
         num_doubles_per_batch = int(p * self.batch_size)
         num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch 
 
@@ -320,21 +318,21 @@ class MPHNSampler(Sampler):
             base = []
             # doubles
             for _ in range(num_doubles_per_batch):
-                gid = double_groups[d_ptr]
+                gid = group_indices[g_ptr]
                 base.append(gid)
                 batch.append(gid+len(self.dataset))
-                d_ptr += 1
+                g_ptr += 1
             batch.extend(base)
             # singles (draw alternating from base/mod)
             for _ in range(num_singles_per_batch):
-                gid = single_groups[s_ptr]
+                gid = group_indices[g_ptr]
                 if random.random() < 0.5:
                     batch.append(gid)
                     leftovers.append(gid+len(self.dataset))
                 else:
                     batch.append(gid+len(self.dataset))
                     leftovers.append(gid)
-                s_ptr += 1
+                g_ptr += 1
             batches.append((batch, num_doubles_per_batch))
 
         # 5. pure singles batches from leftovers
@@ -927,7 +925,6 @@ def get_multi_positive_csv_dataset(args, preprocess_fn, is_train, epoch=0, token
 
 def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     assert is_train, "Multi-Positive dataset is only supported for training. The validation should be done with a regular CSV dataset."
-    assert not (args.hn_scheduler and args.tripletclip), "HNScheduler and TripletCLIP cannot be used together."
 
     dataset = MPHNCsvDataset(
         input_filename=args.train_data,
@@ -956,7 +953,7 @@ def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None)
     dataloader = DataLoaderWithNumDoubles(
         dataset,
         batch_sampler=sampler,
-        collate_fn=lambda b: mphn_collate_fn(b, transforms=dataset.transforms, tokenizer=dataset.tokenize),
+        collate_fn=lambda b: mphn_collate_fn(b, transforms=dataset.transforms, tokenizer=dataset.tokenizer),
         num_workers=args.workers,
         pin_memory=True
     )
