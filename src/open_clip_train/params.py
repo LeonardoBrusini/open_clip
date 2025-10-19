@@ -552,8 +552,13 @@ def parse_args(args):
         action="store_true",
         help="Use a scheduler for hard negative sampling percentage. Only in combination with mphn-csv dataset."
     )
-    
-    
+    parser.add_argument(
+        "--margin-loss",
+        default=False,
+        action="store_true",
+        help="Use hard negative margin loss for training. only in combination with hn-csv dataset. (TODO: add support for tripletclip and mphn-csv)"
+    )
+
     args = parser.parse_args(args)
 
     if 'timm' not in args.opt:

@@ -179,6 +179,9 @@ class MultiPositiveSampler(Sampler):
         else:
             return math.ceil(total_rank / self.batch_size)
 
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
     def __iter__(self):
         g = torch.Generator().manual_seed(self.seed + self.epoch)
         
@@ -295,6 +298,9 @@ class MPHNSampler(Sampler):
             logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}, warmup_epochs={self.scheduler.warmup_epochs}.")
         else:
             logging.info("No scheduler provided, using fixed p=0.5.")
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
     def __iter__(self):
         g = torch.Generator().manual_seed(self.seed + self.epoch)
@@ -345,7 +351,6 @@ class MPHNSampler(Sampler):
             batches.append(batch)
         # 6. shuffle batches order
         if self.shuffle: random.shuffle(batches)
-        self.epoch += 1
         return iter(batches)
 
     def __len__(self): # Number of batches per epoch

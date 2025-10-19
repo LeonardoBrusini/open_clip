@@ -114,7 +114,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     model_out["dist_text_features"] = dist_text_features
                     model_out["dist_logit_scale"] = 100.0
                 losses = loss(**model_out, output_dict=True)
-
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
 

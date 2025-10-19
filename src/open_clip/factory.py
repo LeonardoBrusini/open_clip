@@ -547,7 +547,13 @@ def create_loss(args):
             dist_impl=args.loss_dist_impl,  # siglip has multiple distributed implementations to choose from
         )
 
-    logging.info("Using ClipLoss...")
+    if args.margin_loss:
+        assert args.dataset_type == "hn-csv", "Margin loss is only supported for hn-csv datasets."
+        # TODO: implement margin loss for tripletclip and mphn-csv datasets
+        logging.info("Using ClipLoss with margin loss...")
+    else:
+        logging.info("Using ClipLoss...")
+        
     return ClipLoss(
         local_loss=args.local_loss,
         gather_with_grad=args.gather_with_grad,
@@ -555,6 +561,7 @@ def create_loss(args):
         rank=args.rank,
         world_size=args.world_size,
         use_horovod=args.horovod,
+        hn_margin_loss=args.margin_loss,
     )
 
 

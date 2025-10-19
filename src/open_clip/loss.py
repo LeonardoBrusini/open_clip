@@ -17,6 +17,51 @@ try:
 except ImportError:
     hvd = None
 
+def get_hn_positions(batch_size: int, world_size: int, rank: int, device: torch.device) -> torch.Tensor:
+    """
+    Get positions of hard negatives in the global batch.
+    Each consecutive pair of samples are mutual hard negatives:
+      - for even i:  hn_idx = pos_idx[i] + 1
+      - for odd i:   hn_idx = pos_idx[i] - 1
+    """
+    row_idx = torch.arange(batch_size, device=device)
+    pos_idx = torch.arange(batch_size, device=device) + rank * batch_size
+    hn_idx = pos_idx.clone()
+    hn_idx[::2] = pos_idx[::2] + 1   # even
+    hn_idx[1::2] = pos_idx[1::2] - 1 # odd
+    mask = torch.ones((batch_size, world_size * batch_size), dtype=torch.bool, device=device)
+    mask[row_idx, pos_idx] = False
+    mask[row_idx, hn_idx] = False
+    return row_idx, pos_idx, hn_idx, mask
+
+
+def compute_margin_loss(logits_per_image: torch.Tensor, row_idx: torch.Tensor, pos_idx: torch.Tensor, hn_idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute margin loss.
+    Args:
+        logits_per_image: [batch_size, batch_size * world_size]
+            Similarity scores (image-to-text direction)
+        row_idx: [batch_size,]
+            Row indices for local batch samples
+        pos_idx: [batch_size,]
+            Positive sample indices in global batch
+        hn_idx: [batch_size,]
+            Hard negative sample indices in global batch
+
+    Returns:
+        Scalar tensor with margin loss value
+    """
+    B, BW = logits_per_image.shape
+    # Compute similarity with hard negatives
+    sim_hn = logits_per_image[row_idx, hn_idx]  # [B,]
+    # Compute margin terms
+    diff = logits_per_image - sim_hn.unsqueeze(1)
+    diff = torch.relu(diff)
+    # Average across all anchors and negatives
+    L_margin = (diff * mask).sum() / (B * (BW - 2))
+
+    return L_margin
+
 def gather_features(
         image_features,
         text_features=None,
@@ -90,6 +135,7 @@ class ClipLoss(nn.Module):
             rank=0,
             world_size=1,
             use_horovod=False,
+            hn_margin_loss=False,
     ):
         super().__init__()
         self.local_loss = local_loss
@@ -102,6 +148,10 @@ class ClipLoss(nn.Module):
         # cache state
         self.prev_num_logits = 0
         self.labels = {}
+
+        # whether to use the hard negative margin loss
+        self.hn_margin_loss = hn_margin_loss # Assumes batch is organized as (base, hn, base, hn, ...)
+        self.hn_pos = None
 
     def get_ground_truth(self, device, num_logits) -> torch.Tensor:
         # calculated ground-truth and cache if enabled
@@ -153,15 +203,28 @@ class ClipLoss(nn.Module):
             output_dict=False,
     ):
         device = image_features.device
+        B = image_features.shape[0]
         logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
 
-        labels = self.get_ground_truth(device, logits_per_image.shape[0])
+        labels = self.get_ground_truth(device, B)
 
         total_loss = (
             F.cross_entropy(logits_per_image, labels) +
             F.cross_entropy(logits_per_text, labels)
         ) / 2
 
+        if self.hn_margin_loss:
+            if self.hn_pos is None or self.hn_pos[0].shape[0] != B:
+                self.hn_pos = get_hn_positions(
+                    batch_size=B,
+                    world_size=self.world_size,
+                    rank=self.rank,
+                    device=device
+                )
+            row_idx, pos_idx, hn_idx, mask = self.hn_pos
+            margin_loss = compute_margin_loss(logits_per_image, row_idx, pos_idx, hn_idx, mask)
+            return {"contrastive_loss": total_loss, "hn_margin_loss": margin_loss} if output_dict else (total_loss, margin_loss)
+    
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
@@ -352,7 +415,7 @@ class StableRepPlusLoss(MultiCLIPLoss):
                 use_horovod=self.use_horovod,
             )
 
-            # StableRep originally uses a FIXED temperature of 0.1 and devides the logits, which is equivalent to multiplying by 10
+            # StableRep originally uses a FIXED temperature of 0.1 and divides the logits, which is equivalent to multiplying by 10
             # Thus here we use a logit_scale of 10 to match the original StableRep implementation
 
             if self.local_loss:
@@ -461,6 +524,10 @@ class TripletCLIPLoss(nn.Module):
         self.prev_num_logits = 0
         self.labels = {}
 
+        # whether to use the hard negative margin loss
+        self.hn_margin_loss = margin_loss # Assumes batch is organized as (base, hn, base, hn, ...)
+        self.hn_pos = None
+
     def get_ground_truth(self, device, num_logits) -> torch.Tensor:
         # calculated ground-truth and cache if enabled
         if self.prev_num_logits != num_logits or device not in self.labels:
@@ -485,14 +552,6 @@ class TripletCLIPLoss(nn.Module):
         text_img_similarity = logit_scale * text_embs @ all_img_embs.t()
         img_negtext_similarity = logit_scale * img_embs @ all_neg_text_embs.t()
 
-        '''preds_i2t = torch.cat((img_text_similarity, img_negtext_similarity), dim=-1).argmax(
-            dim=-1
-        )
-        preds_t2i = img_text_similarity.t().argmax(dim=-1)
-        acc_i2t = (preds_i2t == labels).float().mean().item()
-        acc_t2i = (preds_t2i == labels).float().mean().item()
-        accuracy = (acc_i2t + acc_t2i) / 2'''
-
         loss = (
             F.cross_entropy(
                 torch.cat([img_text_similarity, img_negtext_similarity], dim=-1), labels
@@ -503,15 +562,11 @@ class TripletCLIPLoss(nn.Module):
     
     def tripletclip_loss(self, img_embs, text_embs, neg_img_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_img_embs, all_neg_text_embs, logit_scale):
         # cross-type image negatives (base<-->hn) is NOT used in TripletCLIP, that's why i think it is not as good ad the usual clip loss (in optimal conditions)
-        #loss_1, accuracy1 = self.negclip_loss(img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
-        #loss_2, accuracy2 = self.negclip_loss(neg_img_embs, neg_text_embs, text_embs, all_neg_img_embs, all_neg_text_embs, all_text_embs, logit_scale)
         loss_1 = self.negclip_loss(img_embs, text_embs, neg_text_embs, all_img_embs, all_text_embs, all_neg_text_embs, logit_scale)
         loss_2 = self.negclip_loss(neg_img_embs, neg_text_embs, text_embs, all_neg_img_embs, all_neg_text_embs, all_text_embs, logit_scale)
-
         loss = loss_1 + loss_2
-        #accuracy = (accuracy1 + accuracy2) / 2
-        return loss#, accuracy
-
+        return loss
+        
     def forward(
             self,
             image_features,
