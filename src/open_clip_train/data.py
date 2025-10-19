@@ -33,9 +33,7 @@ class CsvDataset(Dataset):
         df = pd.read_csv(input_filename, sep=sep)
 
         self.images = df[img_key].tolist()
-        #logging.info(f'First 10 image paths: {self.images[:10]}')
         self.captions = df[caption_key].tolist()
-        #logging.info(f'First 10 captions: {self.captions[:10]}')
         self.transforms = transforms
         logging.debug('Done loading data.')
 
@@ -53,7 +51,6 @@ class CsvDataset(Dataset):
 
     def __getitem__(self, idx):
         #images = self.transforms(Image.open(str(self.images[idx])))
-        #logging.info(f'Index {idx}: loading image from {self.base_dir}, {str(self.images[idx])}')
         images = self.transforms(Image.open(os.path.join(self.base_dir, str(self.images[idx]))))
         texts = self.tokenize([str(self.captions[idx])])[0]
         return images, texts
@@ -290,12 +287,12 @@ class MPHNSampler(Sampler):
         self.scheduler = scheduler
 
         logging.info(
-            f"Loaded {len(self.dataset)} unique samples with a caption and a hard-negative caption, each with {self.total_views} views. "
-            f"For a total dataset size of {2 * len(self.dataset) * self.total_views} images. "
+            f"Loaded {len(self.dataset)} unique samples with a caption and a hard-negative caption, each with {self.dataset.total_views} views. "
+            f"For a total dataset size of {2 * len(self.dataset) * self.dataset.total_views} images. "
         )
 
         if self.scheduler:
-            logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}, warmup_epochs={self.scheduler.warmup_epochs}.")
+            logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}.")
         else:
             logging.info("No scheduler provided, using fixed p=0.5.")
     
@@ -309,56 +306,51 @@ class MPHNSampler(Sampler):
         logging.info(f"Epoch {self.epoch}: using p={p:.4f} for sampling.")
 
         group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
-        group_indices = group_indices[self.rank::self.num_replicas] # slice for this rank
-
+        group_indices = group_indices[self.rank:len(group_indices):self.num_replicas]
         n_pools = int(len(group_indices) / (self.batch_size * (1 - p)))
-        double_groups = group_indices[:n_pools]
-        single_groups = group_indices[n_pools:]
 
         batches = []
         leftovers = []
-        d_ptr, s_ptr = 0, 0
+        g_ptr = 0
         num_doubles_per_batch = int(p * self.batch_size)
         num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch 
 
         # 4. build mixed batches
         for _ in range(n_pools):
             batch = []
+            base = []
+            # doubles
+            for _ in range(num_doubles_per_batch):
+                gid = group_indices[g_ptr]
+                base.append(gid)
+                batch.append(gid+len(self.dataset))
+                g_ptr += 1
+            batch.extend(base)
             # singles (draw alternating from base/mod)
             for _ in range(num_singles_per_batch):
-                gid = single_groups[s_ptr]
+                gid = group_indices[g_ptr]
                 if random.random() < 0.5:
                     batch.append(gid)
                     leftovers.append(gid+len(self.dataset))
                 else:
                     batch.append(gid+len(self.dataset))
                     leftovers.append(gid)
-                s_ptr += 1
-            # doubles
-            for _ in range(num_doubles_per_batch):
-                gid = double_groups[d_ptr]
-                batch.append(gid)
-                batch.append(gid+len(self.dataset))
-                d_ptr += 1
-            batches.append(batch)
-        
+                g_ptr += 1
+            batches.append((batch, num_doubles_per_batch))
+
         # 5. pure singles batches from leftovers
         random.shuffle(leftovers)
         for i in range(0, len(leftovers), self.batch_size):
             batch = leftovers[i:i+self.batch_size]
-            if self.drop_last and len(batch) < self.batch_size:
-                continue
-            batches.append(batch)
+            if len(batch) == self.batch_size:
+                batches.append((batch, 0))
         # 6. shuffle batches order
         if self.shuffle: random.shuffle(batches)
+        #self.epoch += 1
         return iter(batches)
 
     def __len__(self): # Number of batches per epoch
-        total_rank = math.ceil((2 * len(self.dataset)) / self.num_replicas)
-        if self.drop_last:
-            return total_rank // self.batch_size
-        else:
-            return math.ceil(total_rank / self.batch_size)
+        return (2 * len(self.dataset)) // self.batch_size
 
 def mphn_collate_fn(batch, transforms, tokenizer):
     """
@@ -378,6 +370,13 @@ def mphn_collate_fn(batch, transforms, tokenizer):
     images = torch.stack(images, dim=0)
     texts = torch.stack(texts, dim=0)
     return images, texts
+
+class DataLoaderWithNumDoubles(DataLoader):
+    def __iter__(self):
+        for batch_indices, num_doubles in self.batch_sampler:
+            batch = [self.dataset[i] for i in batch_indices]
+            images, texts = self.collate_fn(batch)
+            yield images, texts, num_doubles
 
 class DistillationCsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
@@ -929,7 +928,6 @@ def get_multi_positive_csv_dataset(args, preprocess_fn, is_train, epoch=0, token
 
 def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     assert is_train, "Multi-Positive dataset is only supported for training. The validation should be done with a regular CSV dataset."
-    assert not (args.hn_scheduler and args.tripletclip), "HNScheduler and TripletCLIP cannot be used together."
 
     dataset = MPHNCsvDataset(
         input_filename=args.train_data,
@@ -955,10 +953,10 @@ def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None)
         epoch=epoch
     ) if is_train else None
     
-    dataloader = DataLoader(
+    dataloader = DataLoaderWithNumDoubles(
         dataset,
         batch_sampler=sampler,
-        collate_fn=lambda b: mphn_collate_fn(b, transforms=dataset.transforms, tokenizer=dataset.tokenize),
+        collate_fn=lambda b: mphn_collate_fn(b, transforms=dataset.transforms, tokenizer=dataset.tokenizer),
         num_workers=args.workers,
         pin_memory=True
     )

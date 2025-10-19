@@ -538,7 +538,7 @@ def parse_args(args):
         "--tripletclip",
         default=False,
         action="store_true",
-        help="Use TripletCLIP loss for training. Only in combination with hn-csv dataset."
+        help="Use TripletCLIP loss for training. Only in combination with hn-csv and mphn-csv dataset."
     )
     parser.add_argument(
         "--hn-clip-loss",

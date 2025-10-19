@@ -439,7 +439,6 @@ def create_loss(args):
     if args.stablerep_plus and args.tripletclip:
         assert args.views_per_caption > 1, "StableRep+ requires multiple views per caption."
         assert args.dataset_type == "mphn-csv", "StableRep+ with TripletCLIP is only supported for mphn-csv datasets."
-        assert not args.hn_scheduler, "HN scheduler is not supported with StableRep+ with TripletCLIP."
         logging.info("Using TripletStableRepLoss...")
         return TripletStableRepLoss(
             m=args.views_per_caption,
