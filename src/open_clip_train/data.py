@@ -328,7 +328,7 @@ class MPHNBatchedSampler(Sampler):
             batch.extend(base)
             for _ in range(num_singles_per_batch):
                 gid = group_indices[g_ptr]
-                if random.random() < 0.5:
+                if rng.random() < 0.5:
                     batch.append(gid)
                     leftovers.append(gid + len(self.dataset))
                 else:
@@ -337,14 +337,16 @@ class MPHNBatchedSampler(Sampler):
                 g_ptr += 1
             batches.append((batch, num_doubles_per_batch))
 
-        random.shuffle(leftovers)
+        rng = random.Random(self.seed + self.epoch)
+
+        rng.shuffle(leftovers)
         for i in range(0, len(leftovers), self.batch_size):
             batch = leftovers[i:i+self.batch_size]
             if len(batch) == self.batch_size:
                 batches.append((batch, 0))
 
         if self.shuffle:
-            random.shuffle(batches)
+            rng.shuffle(batches)
         for b in batches:
             yield b
 
