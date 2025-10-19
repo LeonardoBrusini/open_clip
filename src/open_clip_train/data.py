@@ -223,43 +223,53 @@ def multi_positive_collate_fn(batch, m, transforms, tokenizer):
     texts = torch.stack(texts, dim=0)
     return images, texts
 
+# =========================================
+# Multi-Positive + Hard Negative Dataset
+# =========================================
 class MPHNCsvDataset(Dataset):
-    def __init__(self, input_filename, transforms, img_key, caption_key, base_folder, subfolders, cap_subfolder, hn_subfolder, sep="\t", tokenizer=None):
+    def __init__(self, input_filename, transforms, img_key, caption_key,
+                 base_folder, subfolders, cap_subfolder, hn_subfolder,
+                 sep="\t", tokenizer=None):
         df = pd.read_csv(input_filename, sep=sep)
         self.img_paths = df[img_key].tolist()
         self.captions = df[caption_key].tolist()
         self.hn_captions = df[f"hn_{caption_key}"].tolist()
+
         self.transforms = transforms
-        self.img_key = img_key
-        self.caption_key = caption_key
         self.base_folder = base_folder
         self.subfolders = subfolders
         self.cap_subfolder = cap_subfolder
         self.hn_subfolder = hn_subfolder
         self.tokenizer = tokenizer
-        self.total_views = len(subfolders)   # total variations available per caption
+        self.total_views = len(subfolders)
 
     def __len__(self):
         return len(self.img_paths)
-    
-    def get_all_views(self, idx, mode_subfolder):
-        """Return all possible image paths for this caption."""
-        rel_path = self.img_paths[idx]
-        img_paths = [os.path.join(self.base_folder, sub, mode_subfolder, rel_path) for sub in self.subfolders]
-        return img_paths
+
+    def _get_all_views(self, rel_path, mode_subfolder):
+        return [os.path.join(self.base_folder, sub, mode_subfolder, rel_path)
+                for sub in self.subfolders]
 
     def __getitem__(self, idx):
+        # handle both caption and hard-negative halves
         if idx >= len(self.img_paths):
-            idx -= len(self.img_paths)
+            real_idx = idx - len(self.img_paths)
+            caption = self.hn_captions[real_idx]
             mode_subfolder = self.hn_subfolder
-            cap = self.hn_captions[idx]
-        else: 
+        else:
+            real_idx = idx
+            caption = self.captions[real_idx]
             mode_subfolder = self.cap_subfolder
-            cap = self.captions[idx]
 
-        img_paths = self.get_all_views(idx, mode_subfolder)
-        return img_paths, cap
+        img_paths = self._get_all_views(self.img_paths[real_idx], mode_subfolder)
+        imgs = [self.transforms(Image.open(p).convert("RGB")) for p in img_paths]
+        text = self.tokenizer([str(caption)])[0]
 
+        return torch.stack(imgs), text
+
+# =========================================
+# Scheduler
+# =========================================
 class HNSamplingScheduler:
     def __init__(self, p_max=0.5, n_epochs=40):
         self.p_max = p_max
@@ -269,114 +279,110 @@ class HNSamplingScheduler:
         progress = min(1.0, epoch / self.n_epochs)
         return progress * self.p_max
 
-class MPHNSampler(Sampler):
-    def __init__(self, dataset, batch_size, scheduler=None, num_replicas=1, rank=0, shuffle=True, drop_last=True, seed=0, epoch=0):
-        """
-        dataset: MPHNDataset
-        batch_size: int
-        scheduler: callable(epoch) -> p
-        """
+# =========================
+# Sampler that yields (indices, num_doubles)
+# =========================
+class MPHNBatchedSampler(Sampler):
+    def __init__(self, dataset, batch_size, scheduler=None,
+                 num_replicas=1, rank=0, shuffle=True, drop_last=True,
+                 seed=0, epoch=0):
         self.dataset = dataset
         self.batch_size = batch_size
+        self.scheduler = scheduler
         self.num_replicas = num_replicas
         self.rank = rank
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.seed = seed
         self.epoch = epoch
-        self.scheduler = scheduler
 
         logging.info(
-            f"Loaded {len(self.dataset)} unique samples with a caption and a hard-negative caption, each with {self.dataset.total_views} views. "
-            f"For a total dataset size of {2 * len(self.dataset) * self.dataset.total_views} images. "
+            f"Loaded {len(self.dataset)} samples (caption + hard negative), "
+            f"each with {self.dataset.total_views} views."
         )
 
-        if self.scheduler:
-            logging.info(f"Using scheduler with p_max={self.scheduler.p_max}, n_epochs={self.scheduler.n_epochs}.")
-        else:
-            logging.info("No scheduler provided, using fixed p=0.5.")
-    
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __iter__(self):
         g = torch.Generator().manual_seed(self.seed + self.epoch)
-        if self.scheduler: p = self.scheduler(self.epoch)
-        else: p = 0.5
-        logging.info(f"Epoch {self.epoch}: using p={p:.4f} for sampling.")
+        p = self.scheduler(self.epoch) if self.scheduler else 0.5
+        logging.info(f"Epoch {self.epoch}: using p={p:.4f}")
 
         group_indices = torch.randperm(len(self.dataset), generator=g).tolist() if self.shuffle else list(range(len(self.dataset)))
         group_indices = group_indices[self.rank:len(group_indices):self.num_replicas]
-        n_pools = int(len(group_indices) / (self.batch_size * (1 - p)))
 
-        batches = []
-        leftovers = []
+        n_pools = int(len(group_indices) / (self.batch_size * (1 - p)))
+        batches, leftovers = [], []
         g_ptr = 0
         num_doubles_per_batch = int(p * self.batch_size)
-        num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch 
+        num_singles_per_batch = self.batch_size - 2 * num_doubles_per_batch
 
-        # 4. build mixed batches
         for _ in range(n_pools):
-            batch = []
-            base = []
-            # doubles
+            batch, base = [], []
             for _ in range(num_doubles_per_batch):
                 gid = group_indices[g_ptr]
                 base.append(gid)
-                batch.append(gid+len(self.dataset))
+                batch.append(gid + len(self.dataset))
                 g_ptr += 1
             batch.extend(base)
-            # singles (draw alternating from base/mod)
             for _ in range(num_singles_per_batch):
                 gid = group_indices[g_ptr]
                 if random.random() < 0.5:
                     batch.append(gid)
-                    leftovers.append(gid+len(self.dataset))
+                    leftovers.append(gid + len(self.dataset))
                 else:
-                    batch.append(gid+len(self.dataset))
+                    batch.append(gid + len(self.dataset))
                     leftovers.append(gid)
                 g_ptr += 1
             batches.append((batch, num_doubles_per_batch))
 
-        # 5. pure singles batches from leftovers
         random.shuffle(leftovers)
         for i in range(0, len(leftovers), self.batch_size):
             batch = leftovers[i:i+self.batch_size]
             if len(batch) == self.batch_size:
                 batches.append((batch, 0))
-        # 6. shuffle batches order
-        if self.shuffle: random.shuffle(batches)
-        #self.epoch += 1
-        return iter(batches)
 
-    def __len__(self): # Number of batches per epoch
+        if self.shuffle:
+            random.shuffle(batches)
+        for b in batches:
+            yield b
+
+    def __len__(self):
         return (2 * len(self.dataset)) // self.batch_size
 
-def mphn_collate_fn(batch, transforms, tokenizer):
-    """
-    Args:
-        batch: List of (list_of_all_image_paths, caption)
-    Returns:
-        images: (n*len(subfolders), C, H, W)
-        texts: (n, seq_len)
-    """
-    images = []
-    texts = []
 
-    for all_paths, caption in batch:
-        images.extend([transforms(Image.open(p)) for p in all_paths])
-        texts.append(tokenizer([str(caption)])[0])
+# =========================
+# Adapter: executes dataset indexing in workers
+# =========================
+class MPHNBatchedSamplerAdapter:
+    """Feeds (indices, num_doubles) from batch sampler into DataLoader workers."""
+    def __init__(self, dataset, batch_sampler):
+        self.dataset = dataset
+        self.batch_sampler = batch_sampler
 
-    images = torch.stack(images, dim=0)
-    texts = torch.stack(texts, dim=0)
-    return images, texts
-
-class DataLoaderWithNumDoubles(DataLoader):
     def __iter__(self):
         for batch_indices, num_doubles in self.batch_sampler:
             batch = [self.dataset[i] for i in batch_indices]
-            images, texts = self.collate_fn(batch)
-            yield images, texts, num_doubles
+            yield (batch, num_doubles)
+
+    def __len__(self):
+        return len(self.batch_sampler)
+
+
+# =========================
+# mphn Collate fn
+# =========================
+def mphn_collate_fn(batch):
+    images = torch.cat([b[0] for b in batch], dim=0)
+    texts = torch.stack([b[1] for b in batch], dim=0)
+    return images, texts
+
+
+def mphn_collate_with_meta(batch_with_meta):
+    batch, num_doubles = batch_with_meta
+    images, texts = mphn_collate_fn(batch)
+    return images, texts, num_doubles
 
 class DistillationCsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, is_train, base_folder, sep="\t", tokenizer=None):
@@ -927,7 +933,7 @@ def get_multi_positive_csv_dataset(args, preprocess_fn, is_train, epoch=0, token
     return DataInfo(dataloader, sampler)
 
 def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
-    assert is_train, "Multi-Positive dataset is only supported for training. The validation should be done with a regular CSV dataset."
+    assert is_train, "Multi-Positive dataset is only supported for training."
 
     dataset = MPHNCsvDataset(
         input_filename=args.train_data,
@@ -939,24 +945,28 @@ def get_mphn_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None)
         cap_subfolder=args.cap_subfolder,
         hn_subfolder=args.hn_subfolder,
         sep=args.csv_separator,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
     )
-    sampler = MPHNSampler(
+
+    batch_sampler = MPHNBatchedSampler(
         dataset,
         batch_size=args.batch_size,
-        scheduler=HNSamplingScheduler(n_epochs=args.epochs) if args.hn_scheduler else None,
+        scheduler=HNSamplingScheduler(n_epochs=args.epochs)
+            if args.hn_scheduler else None,
         num_replicas=torch.distributed.get_world_size(),
         rank=torch.distributed.get_rank(),
         shuffle=is_train,
         drop_last=is_train,
         seed=args.seed,
-        epoch=epoch
-    ) if is_train else None
+        epoch=epoch,
+    )
+
+    adapted_sampler = MPHNBatchedSamplerAdapter(dataset, batch_sampler)
     
-    dataloader = DataLoaderWithNumDoubles(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=lambda b: mphn_collate_fn(b, transforms=dataset.transforms, tokenizer=dataset.tokenizer),
+    dataloader = DataLoader(
+        adapted_sampler,
+        batch_size=None,
+        collate_fn=mphn_collate_with_meta,
         num_workers=args.workers,
         pin_memory=True
     )
